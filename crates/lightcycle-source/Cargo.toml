@@ -10,13 +10,16 @@ description = "P2P + RPC block ingestion for lightcycle"
 lightcycle-types.workspace = true
 lightcycle-proto.workspace = true
 
-tokio = { workspace = true, features = ["net", "io-util", "macros", "rt"] }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt", "sync", "time"] }
 tokio-stream.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 tonic.workspace = true
 prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+metrics.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
