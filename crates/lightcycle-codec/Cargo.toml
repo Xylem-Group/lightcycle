@@ -21,5 +21,13 @@ tracing.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 
+# B3 microbench (per BENCHMARKS.md): isolate the protobuf-decode hot
+# path from I/O so we can read it as raw ns/block + ns/transaction on
+# a single core. `harness = false` because criterion provides its own
+# main(), not Rust's default test harness.
+[[bench]]
+name = "decode"
+harness = false
+
 [lints]
 workspace = true
