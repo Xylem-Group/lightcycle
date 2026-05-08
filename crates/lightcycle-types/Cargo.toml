@@ -1,0 +1,16 @@
+[package]
+name = "lightcycle-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain types for lightcycle"
+
+[dependencies]
+serde = { workspace = true }
+hex.workspace = true
+primitive-types.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

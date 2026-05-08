@@ -1,0 +1,25 @@
+[package]
+name = "lightcycle-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Block decode, signature verification, and event decoding for lightcycle"
+
+[dependencies]
+lightcycle-types.workspace = true
+lightcycle-proto.workspace = true
+
+prost.workspace = true
+k256.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[lints]
+workspace = true

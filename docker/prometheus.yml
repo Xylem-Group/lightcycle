@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: lightcycle
+    static_configs:
+      - targets: ["lightcycle:9100"]
+        labels:
+          service: lightcycle

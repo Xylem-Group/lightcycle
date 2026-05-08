@@ -1,0 +1,25 @@
+/target
+/dist
+**/*.rs.bk
+*.pdb
+
+# IDE
+/.vscode
+/.idea
+/.zed
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark output
+/benches/results/*
+!/benches/results/.gitkeep
+
+# Local config
+/.env
+/config.local.toml
+
+# Docker volumes
+/docker/data
+/docker/grafana/data

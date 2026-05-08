@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lightcycle-proto",
+    "crates/lightcycle-types",
+    "crates/lightcycle-codec",
+    "crates/lightcycle-source",
+    "crates/lightcycle-firehose",
+    "crates/lightcycle-store",
+    "crates/lightcycle-relayer",
+    "crates/lightcycle-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+# Tracks rust-toolchain.toml's channel; bumping the toolchain on its
+# own would let MSRV-claiming downstream code drift away from what
+# this workspace actually compiles against.
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lightcycle/lightcycle"
+authors = ["lightcycle contributors"]
+readme = "README.md"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.38", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# gRPC + protobuf
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-build = "0.13"
+prost-types = "0.13"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Logging + telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# Errors
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+hex = "0.4"
+
+# Crypto
+k256 = { version = "0.13", features = ["ecdsa", "sha2"] }
+sha2 = "0.10"
+sha3 = "0.10"
+
+# HTTP client (RPC fallback)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Storage
+redb = "2.1"
+
+# Numerics + EVM-adjacent primitives
+primitive-types = { version = "0.13", features = ["serde"] }
+
+# Bench
+criterion = "0.5"
+
+# Internal
+lightcycle-proto    = { path = "crates/lightcycle-proto",    version = "0.0.1" }
+lightcycle-types    = { path = "crates/lightcycle-types",    version = "0.0.1" }
+lightcycle-codec    = { path = "crates/lightcycle-codec",    version = "0.0.1" }
+lightcycle-source   = { path = "crates/lightcycle-source",   version = "0.0.1" }
+lightcycle-firehose = { path = "crates/lightcycle-firehose", version = "0.0.1" }
+lightcycle-store    = { path = "crates/lightcycle-store",    version = "0.0.1" }
+lightcycle-relayer  = { path = "crates/lightcycle-relayer",  version = "0.0.1" }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = "line-tables-only"
+strip = "symbols"
+
+[profile.bench]
+debug = true

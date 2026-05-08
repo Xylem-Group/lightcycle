@@ -1,0 +1,25 @@
+[package]
+name = "lightcycle-firehose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Firehose-protocol-compatible gRPC server for lightcycle"
+
+[dependencies]
+lightcycle-types.workspace = true
+lightcycle-proto.workspace = true
+
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio-stream.workspace = true
+tonic.workspace = true
+prost.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+metrics.workspace = true
+
+[lints]
+workspace = true

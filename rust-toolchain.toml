@@ -1,0 +1,9 @@
+[toolchain]
+# Pinned to current stable. 1.85 is the minimum-viable for our dep
+# graph (edition2024 demand from indexmap 2.14+); 1.86 is required
+# again by icu_*; rather than chasing the floor each time a transitive
+# dep raises its MSRV, we pin to current stable. Bump deliberately
+# when a new stable lands. The MSRV in workspace.package mirrors this.
+channel = "1.95"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

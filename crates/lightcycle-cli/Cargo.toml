@@ -1,0 +1,28 @@
+[package]
+name = "lightcycle-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "lightcycle CLI binary"
+
+[[bin]]
+name = "lightcycle"
+path = "src/main.rs"
+
+[dependencies]
+lightcycle-relayer.workspace = true
+lightcycle-firehose.workspace = true
+lightcycle-source.workspace = true
+lightcycle-types.workspace = true
+
+clap.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+[lints]
+workspace = true

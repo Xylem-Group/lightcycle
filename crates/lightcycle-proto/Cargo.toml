@@ -1,0 +1,19 @@
+[package]
+name = "lightcycle-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generated protobuf types for lightcycle (TRON wire format + Firehose bstream.v2)"
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+prost-build.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,68 @@
+version: "3.9"
+
+# Local stack: a TRON full node, lightcycle relayer, Prometheus + Grafana.
+# `docker compose up` from this directory is the supported quickstart path.
+
+services:
+  java-tron:
+    image: tronprotocol/java-tron:latest
+    container_name: lightcycle-java-tron
+    restart: unless-stopped
+    ports:
+      - "8090:8090"    # full HTTP API
+      - "50051:50051"  # gRPC
+      - "18888:18888"  # P2P
+    volumes:
+      - ./data/java-tron:/java-tron/output-directory
+      - ./config/main_net_config.conf:/java-tron/config.conf:ro
+    command: ["-c", "/java-tron/config.conf"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/wallet/getnowblock"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+  lightcycle:
+    build:
+      context: ..
+      dockerfile: docker/lightcycle.Dockerfile
+    container_name: lightcycle-relayer
+    depends_on:
+      java-tron:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "13042:13042"  # Firehose gRPC
+      - "9100:9100"    # Prometheus metrics
+    environment:
+      RUST_LOG: "lightcycle=info"
+      LIGHTCYCLE_SOURCE: "p2p://java-tron:18888"
+      LIGHTCYCLE_GRPC_LISTEN: "0.0.0.0:13042"
+      LIGHTCYCLE_METRICS_LISTEN: "0.0.0.0:9100"
+    volumes:
+      - ./data/lightcycle:/var/lib/lightcycle
+    command: ["stream"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lightcycle-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lightcycle-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./data/grafana:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: lightcycle
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
