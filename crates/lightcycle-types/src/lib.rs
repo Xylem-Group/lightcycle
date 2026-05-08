@@ -3,6 +3,8 @@
 //! This crate is intentionally thin: domain primitives only, no I/O, no protobuf,
 //! no async. Everything downstream depends on these types.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// A TRON block height (a.k.a. "block number").
@@ -34,6 +36,53 @@ pub enum Step {
 /// Opaque cursor for stream resumption. Encodes `(height, blockId, forkId)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor(pub Vec<u8>);
+
+/// Active super-representative set — the addresses currently authorized
+/// to produce blocks. TRON's canonical SR set has 27 active members at
+/// any given epoch, but `wallet/listwitnesses` returns the full
+/// configured witness list (including standby SRPs); the source layer
+/// filters to the active subset before constructing this.
+///
+/// The only operation the codec needs is O(1) membership check, so
+/// `HashSet` over `Address` is the right shape. Set transitions across
+/// SR rotations are tracked at the source layer (a new `SrSet` is built
+/// per epoch); the codec is stateless w.r.t. epoch boundaries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SrSet {
+    members: HashSet<Address>,
+}
+
+impl SrSet {
+    /// Build an SR set from any iterable of addresses. Duplicates are
+    /// silently deduped — feeding `listwitnesses` output directly is fine.
+    pub fn new<I: IntoIterator<Item = Address>>(members: I) -> Self {
+        Self {
+            members: members.into_iter().collect(),
+        }
+    }
+
+    pub fn contains(&self, address: &Address) -> bool {
+        self.members.contains(address)
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Address> {
+        self.members.iter()
+    }
+}
+
+impl FromIterator<Address> for SrSet {
+    fn from_iter<I: IntoIterator<Item = Address>>(iter: I) -> Self {
+        Self::new(iter)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

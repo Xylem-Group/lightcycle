@@ -6,8 +6,21 @@
 //! re-running the inspect command and replacing the file). This test
 //! is the difference between "codec works on synthetic input" and
 //! "codec works on bytes-in-the-wild."
+//!
+//! IMPORTANT (witness selection): TRON mainnet has dual-engine SR
+//! signing — roughly 7 of the 27 active SRs use SM2 (the GM/T 0003
+//! Chinese national curve + SM3 hash), the rest use ECKey
+//! (secp256k1 + sha256). The current fixture is from an ECKey-class
+//! witness so that the sigverify tests below exercise the k256
+//! recovery path. When refreshing the fixture, re-run inspect until
+//! the captured block is from a known ECKey-class witness; otherwise
+//! the sigverify tests will fail with `WitnessAddressMismatch`.
+//! SM2 sigverify is a follow-up (separate crate dep, separate path).
 
-use lightcycle_codec::{decode_block, ContractKind};
+use lightcycle_codec::{
+    decode_block, recover_witness_address, verify_witness_signature, ContractKind,
+};
+use lightcycle_types::SrSet;
 
 const MAINNET_HEAD_FIXTURE: &[u8] = include_bytes!("fixtures/mainnet-head.bin");
 
@@ -87,4 +100,51 @@ fn mainnet_block_id_is_deterministic() {
     assert_eq!(a.header.block_id, b.header.block_id);
     assert_eq!(a.header.height, b.header.height);
     assert_eq!(a.transactions.len(), b.transactions.len());
+}
+
+/// The strongest test in this file: a real mainnet block was signed by
+/// the witness whose address is in its own header. ECDSA recovery is
+/// deterministic, so if our recovery + address-derivation pipeline is
+/// even slightly wrong (wrong hash, wrong v normalization, wrong
+/// keccak input slice, wrong network prefix) the recovered address
+/// won't match. Anything that compiles past here is structurally
+/// correct end-to-end.
+#[test]
+fn mainnet_block_signature_recovers_to_header_witness() {
+    let decoded = decode_block(MAINNET_HEAD_FIXTURE).expect("decode");
+    let recovered = recover_witness_address(
+        &decoded.header.block_id.0,
+        &decoded.header.witness_signature,
+    )
+    .expect("recover");
+    assert_eq!(
+        recovered, decoded.header.witness,
+        "recovered address {} doesn't match header witness {}",
+        hex::encode(recovered.0),
+        hex::encode(decoded.header.witness.0),
+    );
+}
+
+/// Full verify path against a one-element SR set seeded from the
+/// header's own witness. This exercises the membership check in
+/// addition to recovery + address match.
+#[test]
+fn mainnet_block_verify_against_self_seeded_sr_set() {
+    let decoded = decode_block(MAINNET_HEAD_FIXTURE).unwrap();
+    let sr_set = SrSet::new([decoded.header.witness]);
+    verify_witness_signature(&decoded.header, &sr_set).expect("verify");
+}
+
+/// Negative control: with an empty SR set, verification must reject
+/// even a perfectly-valid signature. Catches "we silently accepted
+/// because nobody passed an SR set" regressions.
+#[test]
+fn mainnet_block_verify_rejects_empty_sr_set() {
+    let decoded = decode_block(MAINNET_HEAD_FIXTURE).unwrap();
+    let err = verify_witness_signature(&decoded.header, &SrSet::default()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not in the active SR set"),
+        "unexpected error: {msg}"
+    );
 }

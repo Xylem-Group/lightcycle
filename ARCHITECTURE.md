@@ -64,7 +64,7 @@ Maintains the **active SR set** by tracking maintenance period transitions (ever
 
 Pure CPU, no I/O. Takes raw protobuf bytes, returns structured types.
 
-- **Block header verification**: secp256k1 signature recovery, check the recovered witness address against the active SR set, validate the txTrieRoot.
+- **Block header verification**: secp256k1 signature recovery, check the recovered witness address against the active SR set, validate the txTrieRoot. **Caveat — TRON has dual-engine SRs.** Empirically, ~25% of mainnet active witnesses sign blocks with SM2 (China's GM/T 0003 national standard, on a different curve from secp256k1, with SM3 hashing), the rest with ECKey/secp256k1+sha256. The chain accepts both via java-tron's `SignUtils` engine selection. v0.1 implements only the ECKey path; SM2 is a follow-up because it pulls in a separate crypto stack and is irrelevant for the ECKey-class blocks that produce the bulk of throughput. SM2-class blocks pass-through verification still works for indexing — `verify_witness_signature` returns `WitnessAddressMismatch` and the relayer can downgrade to "trust the peer" mode for those headers without losing any tx data.
 - **Transaction decoding**: TRON has 30+ transaction types (`TransferContract`, `TriggerSmartContract`, `FreezeBalanceV2Contract`, `WitnessUpdateContract`, …); we map each to a dedicated Rust enum variant.
 - **Event log decoding**: TRC-20/721 events use the same indexed-topic ABI as Ethereum and decode similarly. ABI registry is pluggable: file-based, HTTP, or on-chain via `getContract`.
 - **Internal transaction extraction**: TRON's `internalTransactions` are exposed via `getTransactionInfoById`; we mirror the parsing logic so live-tail consumers don't need a second round-trip.

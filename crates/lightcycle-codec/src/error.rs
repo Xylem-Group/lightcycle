@@ -1,6 +1,7 @@
 //! Codec error types. Kept in this crate (not in `lightcycle-types`)
 //! so the types crate stays free of `prost` and protobuf concepts.
 
+use lightcycle_types::Address;
 use thiserror::Error;
 
 /// Anything that can go wrong while decoding a block, transaction, or
@@ -51,6 +52,45 @@ pub enum CodecError {
     /// whether to skip or fail.
     #[error("unknown contract type tag {0}")]
     UnknownContractType(i32),
+
+    /// Witness signature (or any 65-byte ECDSA blob) had wrong length.
+    /// Surfaces shape violations before we hand bytes to k256.
+    #[error("expected 65-byte field {field}, got {got} bytes")]
+    BadSignature {
+        field: &'static str,
+        got: usize,
+    },
+
+    /// k256 rejected the signature: malformed r/s, point-not-on-curve,
+    /// or an invalid recovery id. Surfaces as a single variant because
+    /// downstream callers treat them identically — the block is bad.
+    #[error("signature recovery failed (malformed signature, bad recovery id, or non-recoverable point)")]
+    SignatureRecoveryFailed,
+
+    /// Recovery succeeded but produced an address that doesn't match the
+    /// header's claimed `witness`. Indicates a tampered or replayed
+    /// signature: the signer was someone other than the declared witness.
+    #[error(
+        "recovered witness address {} doesn't match header-declared witness {}",
+        hex::encode(recovered.0),
+        hex::encode(expected.0)
+    )]
+    WitnessAddressMismatch {
+        expected: Address,
+        recovered: Address,
+    },
+
+    /// The signature is well-formed and self-consistent (recovers to the
+    /// header's witness), but that witness is not in the active SR set.
+    /// An unauthorized signer; reject the block.
+    #[error(
+        "witness {} is not in the active SR set ({set_size} members)",
+        hex::encode(witness.0)
+    )]
+    WitnessNotInSrSet {
+        witness: Address,
+        set_size: usize,
+    },
 }
 
 /// Crate-local convenience alias; all the codec entry points return this.

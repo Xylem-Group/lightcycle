@@ -14,12 +14,14 @@
 //!   `ContractType` with the awkward `Contract` suffix dropped and an
 //!   `Other(i32)` for forward-compat.
 //!
+//! - [`verify_witness_signature`] / [`recover_witness_address`] —
+//!   secp256k1 ECDSA recovery against the active SR set. Reuses the
+//!   `sha256(raw_data)` digest already computed during decode (it's
+//!   the `block_id`).
+//!
 //! Deferred (separate entry points, separate crates' job to provide
 //! inputs):
 //!
-//! - **Signature verification.** Needs an `SrSet`; the source layer
-//!   tracks SR-set transitions. Lives behind a future
-//!   `verify_witness_signature(decoded, sr_set)`.
 //! - **Event log decoding (TRC-20/721).** Needs an ABI registry. Lives
 //!   behind a future `decode_event(topics, data, abi)`.
 //! - **Internal transaction extraction.** Surfaces only via
@@ -31,8 +33,10 @@
 
 mod block;
 mod error;
+mod sigverify;
 mod transaction;
 
 pub use block::{decode_block, decode_block_message, DecodedBlock, DecodedHeader};
 pub use error::{CodecError, Result};
+pub use sigverify::{recover_witness_address, verify_witness_signature};
 pub use transaction::{ContractKind, DecodedTransaction};

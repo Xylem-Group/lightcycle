@@ -29,5 +29,15 @@ criterion.workspace = true
 name = "decode"
 harness = false
 
+# B2 hypothesis (per BENCHMARKS.md): "≥5K blk/s sustained WITH sigverify
+# on." Decode-only is the lower bound; this bench adds the cryptographic
+# cost — ECDSA recovery + keccak256 address derivation — against a real
+# mainnet block fixture. Three sub-benches isolate recover-only,
+# decode+recover, and full verify-with-SR-set so the marginal cost of
+# each layer is visible.
+[[bench]]
+name = "sigverify"
+harness = false
+
 [lints]
 workspace = true
