@@ -24,6 +24,13 @@ JAVA_TRON_COMMIT="${JAVA_TRON_COMMIT:-master}"
 FIREHOSE_REPO="https://github.com/streamingfast/proto"
 FIREHOSE_COMMIT="${FIREHOSE_COMMIT:-main}"
 
+# google/api/annotations.proto + google/api/http.proto. Needed because
+# java-tron's api/api.proto uses HTTP-transcoding annotations on its
+# gRPC services. We only need the two .proto files, not the rest of
+# googleapis — the find filter below picks them out specifically.
+GOOGLEAPIS_REPO="https://github.com/googleapis/googleapis"
+GOOGLEAPIS_COMMIT="${GOOGLEAPIS_COMMIT:-master}"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROTO_DIR="$ROOT/proto"
 TMP="$(mktemp -d)"
@@ -71,6 +78,19 @@ rm -f "$PROTO_DIR/firehose"/*.proto
 find "$TMP/firehose" -path '*/sf/firehose/v2/*.proto' -exec cp {} "$PROTO_DIR/firehose/" \;
 echo "    copied $(ls "$PROTO_DIR/firehose/" | wc -l | tr -d ' ') .proto files"
 
+echo "==> fetching googleapis @ $GOOGLEAPIS_COMMIT"
+GOOGLEAPIS_SHA=$(fetch_at_ref "$GOOGLEAPIS_REPO" "$TMP/googleapis" "$GOOGLEAPIS_COMMIT")
+echo "    resolved → $GOOGLEAPIS_SHA"
+
+# Vendor only the two .proto files java-tron's api.proto imports —
+# google/api/annotations.proto + google/api/http.proto. The full
+# googleapis repo is hundreds of MB; we need ~6 KB.
+mkdir -p "$PROTO_DIR/google/api"
+rm -f "$PROTO_DIR/google/api"/*.proto
+cp "$TMP/googleapis/google/api/annotations.proto" "$PROTO_DIR/google/api/"
+cp "$TMP/googleapis/google/api/http.proto" "$PROTO_DIR/google/api/"
+echo "    copied $(find "$PROTO_DIR/google/api" -name '*.proto' | wc -l | tr -d ' ') .proto files"
+
 # Stamp the resolved SHAs into proto/README.md so the next reader can
 # reproduce this exact vendoring without grepping git history.
 README="$PROTO_DIR/README.md"
@@ -78,15 +98,18 @@ if [ -f "$README" ]; then
     # Replace any line containing "tronprotocol/java-tron" + "commit `..."
     # patterns. Sed in-place: macOS uses `-i ''`, GNU uses `-i`. Use a
     # tempfile to be portable.
-    python3 - "$README" "$JAVA_TRON_SHA" "$FIREHOSE_SHA" <<'PY'
+    python3 - "$README" "$JAVA_TRON_SHA" "$FIREHOSE_SHA" "$GOOGLEAPIS_SHA" <<'PY'
 import re, sys, pathlib
 p = pathlib.Path(sys.argv[1])
-java_sha, fh_sha = sys.argv[2], sys.argv[3]
+java_sha, fh_sha, ga_sha = sys.argv[2], sys.argv[3], sys.argv[4]
 text = p.read_text()
 text = re.sub(r"(tronprotocol/java-tron[^\n]*?at commit `)[^`]+(`)",
               lambda m: f"{m.group(1)}{java_sha}{m.group(2)}", text)
-text = re.sub(r"(streamingfast/firehose-core[^\n]*?at commit `)[^`]+(`)",
-              lambda m: f"{m.group(1)}{fh_sha}{m.group(2)}", text)
+# Match either `streamingfast/firehose-core` (legacy) or `streamingfast/proto`.
+text = re.sub(r"(streamingfast/(firehose-core|proto)[^\n]*?at commit `)[^`]+(`)",
+              lambda m: f"{m.group(1)}{fh_sha}{m.group(3)}", text)
+text = re.sub(r"(googleapis/googleapis[^\n]*?at commit `)[^`]+(`)",
+              lambda m: f"{m.group(1)}{ga_sha}{m.group(2)}", text)
 p.write_text(text)
 PY
     echo "    stamped SHAs into $README"
@@ -96,3 +119,4 @@ echo
 echo "==> done."
 echo "    java-tron      = $JAVA_TRON_SHA"
 echo "    firehose-core  = $FIREHOSE_SHA"
+echo "    googleapis     = $GOOGLEAPIS_SHA"

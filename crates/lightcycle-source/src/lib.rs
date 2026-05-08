@@ -24,9 +24,11 @@ use futures::Stream;
 use lightcycle_types::BlockHeight;
 use std::pin::Pin;
 
+pub mod grpc;
 pub mod p2p;
 pub mod rpc;
 
+pub use grpc::GrpcSource;
 pub use rpc::{HeadInfo, HeadPoller};
 
 /// A raw block as received from the upstream — protobuf bytes plus minimal metadata.

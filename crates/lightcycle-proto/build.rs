@@ -1,20 +1,25 @@
 //! Build script: compile vendored protos under `../../proto/` to Rust types.
 //!
-//! Two proto trees are compiled, with different client/server requirements:
+//! Three proto trees are compiled, with different client/server requirements:
 //!
 //! - **`proto/tron/`** — `tronprotocol/java-tron`'s wire format and the
 //!   `Wallet` / `WalletSolidity` gRPC services. We are a CLIENT of those
 //!   services (we send queries to a running java-tron), so codegen produces
 //!   client stubs only. The message types themselves are used everywhere
 //!   the codec / source / relayer crates handle blocks and transactions.
-//!   Include path = `proto/tron/` so that
-//!   `import "core/Discover.proto"` etc. resolve.
+//!   Include path = `proto/tron/` plus `proto/google/api/`'s parent so
+//!   `core/Discover.proto` and `google/api/annotations.proto` both resolve.
 //!
 //! - **`proto/firehose/`** — `streamingfast/proto`'s `sf.firehose.v2`
 //!   `Stream` / `Fetch` / `EndpointInfo` services. We SERVE this protocol
 //!   (downstream consumers like Substreams subscribe to us), so we want
 //!   the server stubs. Client stubs are also generated for self-tests
 //!   that round-trip through the same surface.
+//!
+//! - **`proto/google/api/`** — only `annotations.proto` + `http.proto`,
+//!   vendored from googleapis/googleapis. Required by tron/api/api.proto
+//!   for HTTP-transcoding hints on the gRPC services. Two files only;
+//!   the rest of googleapis isn't a dependency.
 //!
 //! Empty `.proto` files (java-tron has a handful of zero-byte stubs in
 //! `core/tron/`) are filtered before being passed to `protoc`, since
@@ -61,25 +66,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Skip `tron/api/` — those service definitions (`Wallet`,
-    // `WalletSolidity`) import `google/api/annotations.proto` for
-    // HTTP-transcoding hints, which aren't shipped with `protoc` and
-    // would require vendoring googleapis just for two files. lightcycle
-    // talks to java-tron's HTTP /wallet/* endpoints (per ARCHITECTURE.md
-    // RPC fallback design), not the gRPC service. If a future need wants
-    // the gRPC client stubs, vendor `google/api/{annotations,http}.proto`
-    // and remove this skip.
-    let tron_files = collect_protos(&tron_dir, &["api"])?;
+    // tron/api/ now compiles too — google/api/{annotations,http}.proto
+    // are vendored under proto/google/api/. The Wallet + WalletSolidity
+    // gRPC client stubs land in lightcycle_proto::tron::api.
+    let tron_files = collect_protos(&tron_dir, &[])?;
     let firehose_files = collect_protos(&firehose_dir, &[])?;
 
-    // Tron.proto + firehose.proto both `import "google/protobuf/any.proto"`
-    // (and timestamp, etc). On macOS-via-brew protoc finds these implicitly;
-    // on Debian-via-apt the well-known `.proto` files live in
-    // /usr/include/google/protobuf/ via the libprotobuf-dev package. Add
-    // /usr/include if the well-known protos are visible there so the same
-    // build.rs works in both environments without per-host tweaks.
-    let mut tron_includes = vec![tron_dir.clone()];
-    let mut firehose_includes = vec![firehose_dir.clone()];
+    // Three include paths:
+    //   1. The proto-tree's own root (`proto/tron/`, `proto/firehose/`)
+    //      so internal cross-imports (`import "core/Discover.proto"`)
+    //      resolve.
+    //   2. `proto_root` itself, so `import "google/api/annotations.proto"`
+    //      resolves to our vendored copy at proto/google/api/...
+    //   3. `/usr/include` IF it has the well-known google/protobuf/*.proto
+    //      (Debian-via-apt installs them there via libprotobuf-dev). On
+    //      macOS-via-brew, protoc finds them implicitly without an
+    //      explicit include — the IF guards skip adding when not needed.
+    let mut tron_includes = vec![tron_dir.clone(), proto_root.clone()];
+    let mut firehose_includes = vec![firehose_dir.clone(), proto_root.clone()];
     let system_include = Path::new("/usr/include");
     if system_include.join("google/protobuf/any.proto").exists() {
         tron_includes.push(system_include.to_path_buf());

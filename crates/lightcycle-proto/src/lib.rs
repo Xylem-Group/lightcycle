@@ -48,6 +48,28 @@ pub mod tron {
         // ergonomic: `tron::contract::TransferContract`.
         pub use super::protocol::*;
     }
+
+    /// java-tron's `Wallet` and `WalletSolidity` gRPC client stubs from
+    /// `api/api.proto`. Used by `lightcycle-source::rpc::grpc` to fetch
+    /// full block bytes via `WalletClient::get_block_by_num`. Also covers
+    /// the `WalletExtension` and `Database` services java-tron exposes
+    /// on the same channel.
+    ///
+    /// Usage:
+    ///
+    /// ```ignore
+    /// use lightcycle_proto::tron::api::wallet_client::WalletClient;
+    /// let mut client = WalletClient::connect("http://127.0.0.1:50051").await?;
+    /// let resp = client.get_block_by_num(NumberMessage { num: 82_500_000 }).await?;
+    /// ```
+    pub mod api {
+        // api.proto's `package protocol;` — same package name as Tron.proto.
+        // tonic-build coalesces them into a single generated file, but we
+        // alias here so call sites can write `tron::api::*` for clarity.
+        // (Reaches into `protocol` because that's where prost lands the
+        // service stubs.)
+        pub use super::protocol::*;
+    }
 }
 
 pub mod firehose {

@@ -80,13 +80,28 @@ struct StreamArgs {
 
 #[derive(Parser, Debug)]
 struct InspectArgs {
-    /// Block height to fetch and decode.
+    /// Block height to fetch and decode. Omit to fetch the current
+    /// head — which is the only option for nodes running LiteFullNode
+    /// mode (the default per ADR 0012); historical `getblockbynum` is
+    /// closed in that mode.
     #[arg(long)]
-    block: u64,
+    block: Option<u64>,
 
-    /// java-tron HTTP RPC base URL.
-    #[arg(long, env = "LIGHTCYCLE_RPC_URL")]
-    rpc_url: String,
+    /// java-tron gRPC endpoint. Default targets the local node via
+    /// loopback. Different from `stream`'s --rpc-url (which is HTTP);
+    /// gRPC is on a separate port (50051 default).
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_GRPC_URL",
+        default_value = "http://127.0.0.1:50051"
+    )]
+    grpc_url: String,
+
+    /// Optional path to dump the encoded `Block` proto bytes (for
+    /// capturing real-mainnet test fixtures). The encoded bytes are
+    /// what `lightcycle_codec::decode_block(&[u8])` consumes.
+    #[arg(long)]
+    dump_to: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -180,10 +195,70 @@ async fn run_stream(args: StreamArgs) -> Result<()> {
 }
 
 async fn run_inspect(args: InspectArgs) -> Result<()> {
-    tracing::info!(?args, "inspect not yet wired up");
-    anyhow::bail!(
-        "inspect requires the full block-fetch RPC path (gRPC GetBlockByNum). \
-         Vendor google/api/annotations.proto and re-enable tron/api/ codegen \
-         to land this; tracking issue: SCAFFOLD.md priority 4."
-    )
+    use lightcycle_codec::{decode_block_message, ContractKind};
+    use lightcycle_source::GrpcSource;
+    use prost::Message;
+    use std::collections::BTreeMap;
+
+    tracing::debug!(?args, "inspect");
+
+    let mut source = GrpcSource::connect(args.grpc_url.clone())
+        .await
+        .with_context(|| format!("connecting to {}", args.grpc_url))?;
+
+    let block = match args.block {
+        Some(h) => source
+            .fetch_block(h)
+            .await
+            .with_context(|| format!("fetching block {h}"))?,
+        None => source
+            .fetch_now_block()
+            .await
+            .context("fetching current head")?,
+    };
+
+    if let Some(path) = args.dump_to.as_ref() {
+        // Round-trip through encode_to_vec to get the canonical wire
+        // representation — what unit tests + fixture-replay code use.
+        let bytes = block.encode_to_vec();
+        std::fs::write(path, &bytes).with_context(|| format!("write {}", path.display()))?;
+        tracing::info!(
+            path = %path.display(),
+            bytes = bytes.len(),
+            "dumped block proto"
+        );
+    }
+
+    let decoded = decode_block_message(&block).context("codec decode failed")?;
+
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    for tx in &decoded.transactions {
+        for c in &tx.contracts {
+            let key = match c {
+                ContractKind::Other(tag) => format!("Other({tag})"),
+                k => format!("{k:?}"),
+            };
+            *by_kind.entry(key).or_default() += 1;
+        }
+    }
+
+    println!("height           : {}", decoded.header.height);
+    println!("block_id         : 0x{}", hex::encode(decoded.header.block_id.0));
+    println!("parent_id        : 0x{}", hex::encode(decoded.header.parent_id.0));
+    println!(
+        "tx_trie_root     : 0x{}",
+        hex::encode(decoded.header.tx_trie_root)
+    );
+    println!("timestamp_ms     : {}", decoded.header.timestamp_ms);
+    println!("witness          : 0x{}", hex::encode(decoded.header.witness.0));
+    println!("witness_sig_len  : {} bytes", decoded.header.witness_signature.len());
+    println!("version          : {}", decoded.header.version);
+    println!("transactions     : {}", decoded.transactions.len());
+    if !by_kind.is_empty() {
+        println!("contract breakdown:");
+        for (kind, n) in &by_kind {
+            println!("  {n:>5}  {kind}");
+        }
+    }
+    Ok(())
 }
