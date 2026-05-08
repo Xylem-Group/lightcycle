@@ -72,6 +72,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tron_files = collect_protos(&tron_dir, &["api"])?;
     let firehose_files = collect_protos(&firehose_dir, &[])?;
 
+    // Tron.proto + firehose.proto both `import "google/protobuf/any.proto"`
+    // (and timestamp, etc). On macOS-via-brew protoc finds these implicitly;
+    // on Debian-via-apt the well-known `.proto` files live in
+    // /usr/include/google/protobuf/ via the libprotobuf-dev package. Add
+    // /usr/include if the well-known protos are visible there so the same
+    // build.rs works in both environments without per-host tweaks.
+    let mut tron_includes = vec![tron_dir.clone()];
+    let mut firehose_includes = vec![firehose_dir.clone()];
+    let system_include = Path::new("/usr/include");
+    if system_include.join("google/protobuf/any.proto").exists() {
+        tron_includes.push(system_include.to_path_buf());
+        firehose_includes.push(system_include.to_path_buf());
+    }
+
     println!(
         "cargo:warning=lightcycle-proto: {} tron + {} firehose .proto files",
         tron_files.len(),
@@ -81,12 +95,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(false)
         .build_client(true)
-        .compile_protos(&tron_files, &[tron_dir])?;
+        .compile_protos(&tron_files, &tron_includes)?;
 
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&firehose_files, &[firehose_dir])?;
+        .compile_protos(&firehose_files, &firehose_includes)?;
 
     println!("cargo:rerun-if-changed=../../proto");
     Ok(())

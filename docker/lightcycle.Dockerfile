@@ -13,8 +13,15 @@ FROM rust:1.95-slim AS builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev protobuf-compiler ca-certificates \
+        pkg-config libssl-dev \
+        protobuf-compiler libprotobuf-dev \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+# `libprotobuf-dev` ships the well-known proto headers (`google/protobuf/
+# any.proto`, `google/protobuf/timestamp.proto`, …) under /usr/include/.
+# Without it, protoc can't resolve `import "google/protobuf/any.proto";`
+# in our vendored `tron/core/Tron.proto`. macOS via brew bundles these
+# implicitly; Debian splits them out into the -dev package.
 
 COPY . .
 

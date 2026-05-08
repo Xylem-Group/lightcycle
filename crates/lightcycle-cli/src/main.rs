@@ -18,12 +18,16 @@ use tracing_subscriber::{fmt, EnvFilter};
 #[derive(Parser, Debug)]
 #[command(name = "lightcycle", version, about = "TRON streaming relayer")]
 struct Cli {
-    /// Log filter (e.g. "lightcycle=info,warn").
-    #[arg(long, env = "RUST_LOG", default_value = "lightcycle=info,warn")]
+    /// Log filter (e.g. "lightcycle=info,warn"). `global` so it's accepted
+    /// at any position; the kulen oci-container module passes args after
+    /// the subcommand because that's the natural shape for an
+    /// argv-shaped `cmd = [...]` list.
+    #[arg(long, env = "RUST_LOG", default_value = "lightcycle=info,warn", global = true)]
     log: String,
 
-    /// Emit logs as plain text (default) or JSON.
-    #[arg(long, default_value = "text")]
+    /// Emit logs as plain text (default) or JSON. Same `global` rationale
+    /// as `log` above.
+    #[arg(long, default_value = "text", global = true)]
     log_format: LogFormat,
 
     #[command(subcommand)]
