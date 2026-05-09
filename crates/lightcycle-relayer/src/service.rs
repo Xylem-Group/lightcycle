@@ -18,23 +18,26 @@
 //!
 //! ## Verify policy
 //!
-//! TRON's dual-engine SR signing means ~25% of mainnet blocks are
-//! signed with SM2 (see `project_tron_dual_engine_sigs` memory + the
-//! codec ARCHITECTURE caveat). Our secp256k1 sigverify returns
-//! `WitnessAddressMismatch` on those blocks. The relayer needs a
-//! policy for what to do:
+//! [`VerifyPolicy`] controls the relayer's response to sigverify
+//! failures.
 //!
 //! - [`VerifyPolicy::Disabled`] — never call sigverify. Useful for
 //!   fixture replay and for benchmarks where verification is
 //!   measured separately.
-//! - [`VerifyPolicy::Lenient`] (default) — verify; accept
-//!   WitnessAddressMismatch as expected SM2-class output, log + count.
-//!   Reject other verify errors (malformed sig, signer not in SR
-//!   set) — those indicate either a peer-quality problem or a
+//! - [`VerifyPolicy::Lenient`] (default) — verify; tolerate
+//!   `WitnessAddressMismatch` (log + count) and accept the block
+//!   anyway. Useful around SR-set rotations where our cached set may
+//!   briefly disagree with the producer of an in-flight block. Reject
+//!   all other verify errors (malformed sig, signer not in SR set
+//!   even after refresh) — those indicate a peer-quality problem or a
 //!   compromised SR.
-//! - [`VerifyPolicy::Strict`] — reject any verify failure. Will
-//!   correctly drop ~25% of mainnet blocks. Use only when SM2
-//!   support lands, or when running against an ECKey-only testnet.
+//! - [`VerifyPolicy::Strict`] — reject any verify failure. The
+//!   correct posture once the SR-set refresh on epoch transitions is
+//!   battle-tested. Earlier sessions held this policy off because of a
+//!   suspected dual-engine (SM2) signing pathway in TRON; investigation
+//!   2026-05-09 confirmed SM2 is dormant in java-tron and unused on
+//!   mainnet, so the strict-rejection regime is now correct in
+//!   principle (see `project_tron_dual_engine_sigs` memory).
 //!
 //! ## Gap handling
 //!
@@ -68,15 +71,13 @@ use tracing::{debug, error, info, warn};
 use crate::engine::{Output, ReorgEngine, ReorgError};
 
 /// Policy for how to react to verify failures. See module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerifyPolicy {
     Disabled,
     #[default]
     Lenient,
     Strict,
 }
-
 
 /// What `BlockFetcher` returns: the decoded block plus the side-channel
 /// `TransactionInfo` payload (logs, internal txs, resource accounting)

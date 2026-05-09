@@ -43,7 +43,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      # v1 ships an older cargo-deny that can't parse CVSS 4.0 entries
+      # in the advisory DB (RUSTSEC-2026-0073 surfaced this); v2.0.17
+      # ships cargo-deny 0.19.2+ which handles CVSS 4.0.
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
   docs:
     runs-on: ubuntu-latest
