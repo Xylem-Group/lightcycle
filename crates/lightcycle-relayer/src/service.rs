@@ -69,17 +69,14 @@ use crate::engine::{Output, ReorgEngine, ReorgError};
 
 /// Policy for how to react to verify failures. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum VerifyPolicy {
     Disabled,
+    #[default]
     Lenient,
     Strict,
 }
 
-impl Default for VerifyPolicy {
-    fn default() -> Self {
-        Self::Lenient
-    }
-}
 
 /// What `BlockFetcher` returns: the decoded block plus the side-channel
 /// `TransactionInfo` payload (logs, internal txs, resource accounting)

@@ -308,8 +308,7 @@ async fn fetch_block_round_trip() {
             transforms: vec![],
         })
         .await
-        .err()
-        .expect("expected NotFound");
+        .expect_err("expected NotFound");
     assert_eq!(err.code(), tonic::Code::NotFound);
 
     let _ = shutdown_tx.send(());
@@ -350,8 +349,7 @@ async fn live_stream_rejects_cursor_request() {
             transforms: vec![],
         })
         .await
-        .err()
-        .expect("expected FailedPrecondition for cursor=...");
+        .expect_err("expected FailedPrecondition for cursor=...");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
     let _ = shutdown_tx.send(());

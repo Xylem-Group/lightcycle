@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(pb_info.logs[0].topics.len(), 3);
         assert_eq!(pb_info.logs[0].data, vec![0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(pb_info.internal_transactions.len(), 1);
-        assert_eq!(pb_info.internal_transactions[0].rejected, false);
+        assert!(!pb_info.internal_transactions[0].rejected);
         assert_eq!(
             pb_info.internal_transactions[0].call_values[0].call_value,
             100

@@ -5,7 +5,7 @@
 //! step semantics. v0.1 ships `Stream.Blocks` (live mode only),
 //! `Fetch.Block` (point-in-time by number), and `EndpointInfo.Info`.
 //! `Stream.Blocks` backfill via cursor / start_block_num requires the
-//! [`lightcycle-store`] crate to be wired in, which is a separate piece
+//! `lightcycle-store` crate to be wired in, which is a separate piece
 //! of work.
 //!
 //! Architecture in four pieces:
@@ -29,7 +29,7 @@
 //!   `BlockHashAndNumber`, no `Cursor`); no `transforms`
 //! - `final_blocks_only` and `transforms` on Stream
 //! - `TransactionInfo` side-channel join — the
-//!   [`sf.tron.type.v1.Block`] payload is fully populated for
+//!   `sf.tron.type.v1.Block` payload is fully populated for
 //!   header / transactions / contracts, but `Transaction.info`
 //!   (logs, internal txs, resource accounting) is unset because
 //!   ingest doesn't yet fetch `getTransactionInfoByBlockNum`. When

@@ -8,7 +8,7 @@
 //!   `Block` into [`DecodedBlock`] (header + transactions). The
 //!   contract `Any` payload on each transaction is intentionally NOT
 //!   unwrapped here; consumers that want the typed contract message
-//!   call [`decode_contract_payload`] (TODO; lands when a consumer
+//!   call `decode_contract_payload` (TODO; lands when a consumer
 //!   asks).
 //! - [`ContractKind`] — friendly enum mirroring java-tron's wire
 //!   `ContractType` with the awkward `Contract` suffix dropped and an

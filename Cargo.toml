@@ -19,7 +19,7 @@ edition = "2021"
 # this workspace actually compiles against.
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/lightcycle/lightcycle"
+repository = "https://github.com/Xylem-Group/lightcycle"
 authors = ["lightcycle contributors"]
 readme = "README.md"
 
@@ -29,9 +29,15 @@ missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
+# `clippy::all` catches real bugs and is what CI gates on (-D warnings).
+# `pedantic` and `nursery` contain stylistic and unstable suggestions that
+# are too noisy + opinionated to be CI-gating; running them locally as
+# guidance is fine, but they should not block contributors. The few
+# pedantic lints that are unambiguously good (e.g., `must_use_candidate`
+# on public APIs) can be opted into per-crate when we want them.
 all = "warn"
-pedantic = "warn"
-nursery = "warn"
+pedantic = "allow"
+nursery = "allow"
 
 [workspace.dependencies]
 # Async runtime

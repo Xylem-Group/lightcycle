@@ -43,7 +43,7 @@ pub struct DecodedHeader {
     pub parent_id: BlockId,
     /// `sha256(raw_data)` — the unprefixed digest. This is what the
     /// SR signs, so [`crate::verify_witness_signature`] uses it as
-    /// the recovery prehash. Distinct from [`block_id`] because the
+    /// the recovery prehash. Distinct from `block_id` because the
     /// block id is height-prefixed and would not recover correctly.
     pub raw_data_hash: [u8; 32],
     /// `raw_data.tx_trie_root` — Merkle root of the transactions list.
@@ -254,7 +254,7 @@ mod tests {
         }));
         // Each tx has a unique timestamp → unique hash → no duplicates.
         let mut hashes: Vec<_> = decoded.transactions.iter().map(|t| t.hash).collect();
-        hashes.sort_by(|a, b| a.0.cmp(&b.0));
+        hashes.sort_by_key(|a| a.0);
         let n_before = hashes.len();
         hashes.dedup();
         assert_eq!(hashes.len(), n_before);

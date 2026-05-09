@@ -29,7 +29,7 @@
 //!   compute the longer-chain switch) require sibling buffering. TRON's
 //!   actual reorg distribution is tail-heavy at depth 1; the deeper
 //!   path lands when we have a real-mainnet sample showing it matters.
-//! - **gRPC streaming surface.** That's [`lightcycle-firehose`]'s job.
+//! - **gRPC streaming surface.** That's `lightcycle-firehose`'s job.
 //!   The engine produces [`Output`]s; the firehose multiplexes them.
 
 #![allow(dead_code)]
