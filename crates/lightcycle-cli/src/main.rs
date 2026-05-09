@@ -234,7 +234,7 @@ async fn run_inspect(args: InspectArgs) -> Result<()> {
     let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
     for tx in &decoded.transactions {
         for c in &tx.contracts {
-            let key = match c {
+            let key = match c.kind() {
                 ContractKind::Other(tag) => format!("Other({tag})"),
                 k => format!("{k:?}"),
             };

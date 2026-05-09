@@ -1377,6 +1377,7 @@ dependencies = [
  "lightcycle-proto",
  "lightcycle-types",
  "prost",
+ "prost-types",
  "sha2",
  "sha3",
  "thiserror 1.0.69",

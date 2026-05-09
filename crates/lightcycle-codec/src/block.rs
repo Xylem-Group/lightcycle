@@ -166,6 +166,9 @@ mod tests {
     /// trivial transactions. Useful for tests + benchmarks; not
     /// representative of mainnet density.
     pub(crate) fn synth_block(height: i64, n_txs: usize) -> Vec<u8> {
+        use lightcycle_proto::tron::protocol::TransferContract;
+        use prost_types::Any;
+
         let raw_header = RawHeader {
             timestamp: 1_777_854_558_000,
             tx_trie_root: vec![0xab; 32],
@@ -181,6 +184,24 @@ mod tests {
             witness_signature: vec![0x99; 65],
         };
 
+        // Each synthetic tx carries a valid TransferContract payload —
+        // the new decoder unwraps Any so the payload bytes can't be empty.
+        let mut payload_addr_owner = [0u8; 21];
+        payload_addr_owner[0] = 0x41;
+        payload_addr_owner[1..].fill(0x10);
+        let mut payload_addr_to = [0u8; 21];
+        payload_addr_to[0] = 0x41;
+        payload_addr_to[1..].fill(0x20);
+        let transfer = TransferContract {
+            owner_address: payload_addr_owner.to_vec(),
+            to_address: payload_addr_to.to_vec(),
+            amount: 1,
+        };
+        let transfer_any = Any {
+            type_url: "type.googleapis.com/protocol.TransferContract".into(),
+            value: transfer.encode_to_vec(),
+        };
+
         let txs: Vec<Transaction> = (0..n_txs)
             .map(|i| Transaction {
                 raw_data: Some(RawTx {
@@ -192,7 +213,7 @@ mod tests {
                     data: vec![],
                     contract: vec![Contract {
                         r#type: ContractType::TransferContract as i32,
-                        parameter: None,
+                        parameter: Some(transfer_any.clone()),
                         provider: vec![],
                         contract_name: vec![],
                         permission_id: 0,
@@ -227,10 +248,10 @@ mod tests {
         let bytes = synth_block(82_500_001, 200);
         let decoded = decode_block(&bytes).expect("decode");
         assert_eq!(decoded.transactions.len(), 200);
-        assert!(decoded
-            .transactions
-            .iter()
-            .all(|tx| tx.contracts == vec![crate::transaction::ContractKind::Transfer]));
+        assert!(decoded.transactions.iter().all(|tx| {
+            tx.contracts.len() == 1
+                && tx.contracts[0].kind() == crate::transaction::ContractKind::Transfer
+        }));
         // Each tx has a unique timestamp → unique hash → no duplicates.
         let mut hashes: Vec<_> = decoded.transactions.iter().map(|t| t.hash).collect();
         hashes.sort_by(|a, b| a.0.cmp(&b.0));

@@ -85,9 +85,9 @@ fn mainnet_block_has_recognized_contract_types() {
     for tx in &decoded.transactions {
         for c in &tx.contracts {
             assert!(
-                !matches!(c, ContractKind::Other(_)),
+                !matches!(c.kind(), ContractKind::Other(_)),
                 "unrecognized contract tag {:?} — vendor refresh needed?",
-                c
+                c.kind()
             );
         }
     }

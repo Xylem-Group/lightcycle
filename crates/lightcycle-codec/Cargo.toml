@@ -20,6 +20,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+prost-types.workspace = true
 
 # B3 microbench (per BENCHMARKS.md): isolate the protobuf-decode hot
 # path from I/O so we can read it as raw ns/block + ns/transaction on
