@@ -14,6 +14,10 @@
 //! - [`firehose`] — `sf.firehose.v2`'s `Stream` / `Fetch` / `EndpointInfo`
 //!   services. Includes both server and client stubs.
 //!
+//! - [`sf`] — lightcycle-authored payload types ([`sf::tron::type_v1`]).
+//!   Chain-specific block shape that ships on Firehose `Response.block`.
+//!   Pure message types; no services.
+//!
 //! The codegen output files are named after the `package` declared in each
 //! `.proto`, so the `include_proto!` calls below mirror those packages
 //! one-to-one.
@@ -79,5 +83,31 @@ pub mod firehose {
     /// envelopes. Generated with both server and client stubs.
     pub mod v2 {
         tonic::include_proto!("sf.firehose.v2");
+    }
+}
+
+pub mod sf {
+    //! lightcycle-authored streamingfast-namespaced payload types.
+    //!
+    //! These are NOT vendored from upstream — we own the schema. Lives
+    //! under the `sf.*` package because that's the convention Firehose
+    //! consumers (Substreams modules in particular) expect for
+    //! chain-specific block payloads.
+
+    pub mod tron {
+        //! TRON-specific payloads.
+
+        /// `sf.tron.type.v1` — block, transaction, contract, and tx-info
+        /// types shipped on Firehose `Response.block`. See the proto
+        /// at `proto/sf/tron/type/v1/block.proto` for field-level docs.
+        ///
+        /// Module is named `type_v1` rather than `type::v1` because
+        /// `type` is a Rust keyword. The `r#type` in the include path
+        /// is prost-build's filename for the generated Rust file —
+        /// it raw-escapes the keyword segment of the proto package
+        /// name, so the on-disk file is literally `sf.tron.r#type.v1.rs`.
+        pub mod type_v1 {
+            tonic::include_proto!("sf.tron.r#type.v1");
+        }
     }
 }

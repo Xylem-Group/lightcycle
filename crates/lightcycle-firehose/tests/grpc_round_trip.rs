@@ -10,13 +10,15 @@
 use std::time::Duration;
 
 use lightcycle_codec::{DecodedBlock, DecodedHeader};
-use lightcycle_firehose::{serve, Hub};
+use lightcycle_firehose::{serve, Hub, BLOCK_TYPE_URL};
 use lightcycle_proto::firehose::v2::{
     endpoint_info_client::EndpointInfoClient, stream_client::StreamClient, ForkStep, InfoRequest,
     Request,
 };
+use lightcycle_proto::sf::tron::type_v1 as tron_v1;
 use lightcycle_relayer::{BufferedBlock, Cursor, Output, StreamableBlock};
 use lightcycle_types::{Address, BlockId, Step};
+use prost::Message;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 
@@ -120,6 +122,19 @@ async fn live_stream_round_trip() {
     assert_eq!(md.parent_num, 82_531_246);
     assert_eq!(md.id.len(), 64);
     assert!(!resp.cursor.is_empty(), "cursor should be hex-encoded");
+
+    // Response.block must carry the chain-specific TRON proto, not
+    // the old placeholder. type_url + non-empty value + decodable as
+    // sf.tron.type.v1.Block with matching height.
+    let block_any = resp.block.expect("block payload");
+    assert_eq!(block_any.type_url, BLOCK_TYPE_URL);
+    let decoded =
+        tron_v1::Block::decode(block_any.value.as_slice()).expect("decode sf.tron.type.v1.Block");
+    assert_eq!(decoded.number, 82_531_247);
+    assert_eq!(decoded.id.len(), 32);
+    assert_eq!(decoded.parent_id.len(), 32);
+    assert!(decoded.header.is_some());
+    assert!(decoded.transactions.is_empty(), "synth block had no txs");
 
     // Shut the server down cleanly.
     let _ = shutdown_tx.send(());

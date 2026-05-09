@@ -205,6 +205,59 @@ impl ContractKind {
         }
     }
 
+    /// Round-trip the friendly enum back to its wire-format `i32` tag.
+    /// `Other(tag)` round-trips verbatim so unknown wire types
+    /// re-encode losslessly. Used by encoders that need to emit the
+    /// raw wire tag onto a downstream proto (e.g. `sf.tron.type.v1`'s
+    /// `Contract.unknown_kind`).
+    pub fn to_wire_tag(self) -> i32 {
+        use ContractKind::*;
+        match self {
+            AccountCreate => WireContractType::AccountCreateContract as i32,
+            Transfer => WireContractType::TransferContract as i32,
+            TransferAsset => WireContractType::TransferAssetContract as i32,
+            VoteAsset => WireContractType::VoteAssetContract as i32,
+            VoteWitness => WireContractType::VoteWitnessContract as i32,
+            WitnessCreate => WireContractType::WitnessCreateContract as i32,
+            AssetIssue => WireContractType::AssetIssueContract as i32,
+            WitnessUpdate => WireContractType::WitnessUpdateContract as i32,
+            ParticipateAssetIssue => WireContractType::ParticipateAssetIssueContract as i32,
+            AccountUpdate => WireContractType::AccountUpdateContract as i32,
+            FreezeBalance => WireContractType::FreezeBalanceContract as i32,
+            UnfreezeBalance => WireContractType::UnfreezeBalanceContract as i32,
+            WithdrawBalance => WireContractType::WithdrawBalanceContract as i32,
+            UnfreezeAsset => WireContractType::UnfreezeAssetContract as i32,
+            UpdateAsset => WireContractType::UpdateAssetContract as i32,
+            ProposalCreate => WireContractType::ProposalCreateContract as i32,
+            ProposalApprove => WireContractType::ProposalApproveContract as i32,
+            ProposalDelete => WireContractType::ProposalDeleteContract as i32,
+            SetAccountId => WireContractType::SetAccountIdContract as i32,
+            Custom => WireContractType::CustomContract as i32,
+            CreateSmartContract => WireContractType::CreateSmartContract as i32,
+            TriggerSmartContract => WireContractType::TriggerSmartContract as i32,
+            GetContract => WireContractType::GetContract as i32,
+            UpdateSetting => WireContractType::UpdateSettingContract as i32,
+            ExchangeCreate => WireContractType::ExchangeCreateContract as i32,
+            ExchangeInject => WireContractType::ExchangeInjectContract as i32,
+            ExchangeWithdraw => WireContractType::ExchangeWithdrawContract as i32,
+            ExchangeTransaction => WireContractType::ExchangeTransactionContract as i32,
+            UpdateEnergyLimit => WireContractType::UpdateEnergyLimitContract as i32,
+            AccountPermissionUpdate => WireContractType::AccountPermissionUpdateContract as i32,
+            ClearAbi => WireContractType::ClearAbiContract as i32,
+            UpdateBrokerage => WireContractType::UpdateBrokerageContract as i32,
+            ShieldedTransfer => WireContractType::ShieldedTransferContract as i32,
+            MarketSellAsset => WireContractType::MarketSellAssetContract as i32,
+            MarketCancelOrder => WireContractType::MarketCancelOrderContract as i32,
+            FreezeBalanceV2 => WireContractType::FreezeBalanceV2Contract as i32,
+            UnfreezeBalanceV2 => WireContractType::UnfreezeBalanceV2Contract as i32,
+            WithdrawExpireUnfreeze => WireContractType::WithdrawExpireUnfreezeContract as i32,
+            DelegateResource => WireContractType::DelegateResourceContract as i32,
+            UnDelegateResource => WireContractType::UnDelegateResourceContract as i32,
+            CancelAllUnfreezeV2 => WireContractType::CancelAllUnfreezeV2Contract as i32,
+            Other(tag) => tag,
+        }
+    }
+
     fn from_wire_enum(t: WireContractType) -> Self {
         use WireContractType::*;
         match t {
@@ -556,5 +609,34 @@ mod tests {
             raw: vec![],
         };
         assert_eq!(o.kind(), ContractKind::WitnessCreate);
+    }
+
+    #[test]
+    fn to_wire_tag_round_trips_known_variants() {
+        // Spot-check several variants against their explicit wire tags.
+        // The decode-then-encode round trip is the contract this method
+        // upholds; reverse direction (`from_wire(to_wire_tag(k)) == k`)
+        // must hold for every named variant.
+        for kind in [
+            ContractKind::AccountCreate,
+            ContractKind::Transfer,
+            ContractKind::TransferAsset,
+            ContractKind::TriggerSmartContract,
+            ContractKind::CreateSmartContract,
+            ContractKind::FreezeBalanceV2,
+            ContractKind::DelegateResource,
+            ContractKind::CancelAllUnfreezeV2,
+        ] {
+            let tag = kind.to_wire_tag();
+            assert_eq!(ContractKind::from_wire(tag), kind, "round-trip {kind:?}");
+        }
+    }
+
+    #[test]
+    fn to_wire_tag_preserves_unknown_tag() {
+        // Forward-compat: an unknown wire tag must round-trip.
+        let unknown = ContractKind::Other(9999);
+        assert_eq!(unknown.to_wire_tag(), 9999);
+        assert_eq!(ContractKind::from_wire(9999), unknown);
     }
 }

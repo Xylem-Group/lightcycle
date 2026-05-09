@@ -84,7 +84,11 @@ gRPC server speaking the [`sf.firehose.v2`](https://github.com/streamingfast/pro
 
 v0.1 ships **live mode only**: `Stream.Blocks` rejects requests carrying `cursor`, `start_block_num`, `stop_block_num`, `final_blocks_only`, or `transforms` with `FailedPrecondition`. Backfill / replay and the `Fetch.Block` service land when [`lightcycle-store`] is wired into the pipeline (cursor → buffered/persisted block lookup). `EndpointInfo.Info` is implemented and reports chain identity for orchestrator sanity-check.
 
-`Response.metadata` is fully populated (num, id, parent_num, parent_id, lib_num=0 for now, time). `Response.block` carries a placeholder `Any` (zero bytes) until the chain-specific `sf.tron.type.v1.Block` proto lands — Substreams modules will need that payload to do anything useful, but consumers that only need the cursor + metadata stream work today.
+`Response.metadata` is fully populated (num, id, parent_num, parent_id, lib_num=0 for now, time). `Response.block` carries a `google.protobuf.Any` whose `type_url` is `type.googleapis.com/sf.tron.type.v1.Block` and whose value is the prost-encoded `sf.tron.type.v1.Block` — header, transactions, and contract payloads (typed for the four high-volume contract kinds: `Transfer`, `TransferAsset`, `TriggerSmartContract`, `CreateSmartContract`; raw bytes plus wire kind tag for everything else, so consumers can decode locally against java-tron's protobuf for the long-tail governance/admin contracts).
+
+The proto carries a `Transaction.info` field for `TransactionInfo` (logs, internal txs, resource accounting), but it's left unset in v0.1 — the ingest pipeline doesn't yet fetch java-tron's `getTransactionInfoByBlockNum` side channel. When that lands, existing consumers transparently start seeing populated `info` without any wire change. This is the dominant TRC-20 indexing use case; consumers that need event logs today must continue calling the upstream node's tx-info endpoint themselves.
+
+The proto schema lives at `proto/sf/tron/type/v1/block.proto` and is compiled into `lightcycle_proto::sf::tron::type_v1`. The encoder (`lightcycle_firehose::encode_block`) maps `BufferedBlock` → wire proto in pure CPU.
 
 ### lightcycle-store
 

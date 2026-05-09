@@ -1,6 +1,6 @@
 //! Build script: compile vendored protos under `../../proto/` to Rust types.
 //!
-//! Three proto trees are compiled, with different client/server requirements:
+//! Four proto trees are compiled, with different client/server requirements:
 //!
 //! - **`proto/tron/`** — `tronprotocol/java-tron`'s wire format and the
 //!   `Wallet` / `WalletSolidity` gRPC services. We are a CLIENT of those
@@ -15,6 +15,11 @@
 //!   (downstream consumers like Substreams subscribe to us), so we want
 //!   the server stubs. Client stubs are also generated for self-tests
 //!   that round-trip through the same surface.
+//!
+//! - **`proto/sf/`** — lightcycle-authored `sf.tron.type.v1.Block` and
+//!   friends. The chain-specific block payload that ships on Firehose
+//!   `Response.block`. Pure message types; no services, no client/server
+//!   stubs.
 //!
 //! - **`proto/google/api/`** — only `annotations.proto` + `http.proto`,
 //!   vendored from googleapis/googleapis. Required by tron/api/api.proto
@@ -58,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = Path::new("../../proto").canonicalize()?;
     let tron_dir = proto_root.join("tron");
     let firehose_dir = proto_root.join("firehose");
+    let sf_dir = proto_root.join("sf");
 
     if !tron_dir.exists() || !firehose_dir.exists() {
         println!(
@@ -71,11 +77,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // gRPC client stubs land in lightcycle_proto::tron::api.
     let tron_files = collect_protos(&tron_dir, &[])?;
     let firehose_files = collect_protos(&firehose_dir, &[])?;
+    let sf_files = if sf_dir.exists() {
+        collect_protos(&sf_dir, &[])?
+    } else {
+        Vec::new()
+    };
 
-    // Three include paths:
-    //   1. The proto-tree's own root (`proto/tron/`, `proto/firehose/`)
-    //      so internal cross-imports (`import "core/Discover.proto"`)
-    //      resolve.
+    // Include paths:
+    //   1. The proto-tree's own root (`proto/tron/`, `proto/firehose/`,
+    //      `proto/sf/`) so internal cross-imports
+    //      (`import "core/Discover.proto"`) resolve.
     //   2. `proto_root` itself, so `import "google/api/annotations.proto"`
     //      resolves to our vendored copy at proto/google/api/...
     //   3. `/usr/include` IF it has the well-known google/protobuf/*.proto
@@ -84,16 +95,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //      explicit include — the IF guards skip adding when not needed.
     let mut tron_includes = vec![tron_dir.clone(), proto_root.clone()];
     let mut firehose_includes = vec![firehose_dir.clone(), proto_root.clone()];
+    let mut sf_includes = vec![sf_dir.clone(), proto_root.clone()];
     let system_include = Path::new("/usr/include");
     if system_include.join("google/protobuf/any.proto").exists() {
         tron_includes.push(system_include.to_path_buf());
         firehose_includes.push(system_include.to_path_buf());
+        sf_includes.push(system_include.to_path_buf());
     }
 
     println!(
-        "cargo:warning=lightcycle-proto: {} tron + {} firehose .proto files",
+        "cargo:warning=lightcycle-proto: {} tron + {} firehose + {} sf .proto files",
         tron_files.len(),
-        firehose_files.len()
+        firehose_files.len(),
+        sf_files.len()
     );
 
     tonic_build::configure()
@@ -105,6 +119,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .compile_protos(&firehose_files, &firehose_includes)?;
+
+    // sf protos are pure messages (no services), so no client/server
+    // stubs. tonic_build still picks up the prost message codegen.
+    if !sf_files.is_empty() {
+        tonic_build::configure()
+            .build_server(false)
+            .build_client(false)
+            .compile_protos(&sf_files, &sf_includes)?;
+    }
 
     println!("cargo:rerun-if-changed=../../proto");
     Ok(())

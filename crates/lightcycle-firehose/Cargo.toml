@@ -10,6 +10,7 @@ description = "Firehose-protocol-compatible gRPC server for lightcycle"
 lightcycle-types.workspace = true
 lightcycle-proto.workspace = true
 lightcycle-relayer.workspace = true
+lightcycle-codec.workspace = true
 
 tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 tokio-stream.workspace = true
@@ -26,7 +27,6 @@ metrics.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
-lightcycle-codec.workspace = true
 
 [lints]
 workspace = true

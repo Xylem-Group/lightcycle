@@ -19,11 +19,15 @@
 //!
 //! `Response.metadata` is fully populated: num, id (hex), parent_num,
 //! parent_id (hex), lib_num, time. This is what dashboards and
-//! orchestrators read. `Response.block` carries an `Any` with our
-//! placeholder type_url + zero-byte payload — full chain-specific
-//! TRON block proto lands separately. Substreams modules will need
-//! that payload to do anything useful; consumers that only need the
-//! cursor + metadata stream work today.
+//! orchestrators read. `Response.block` carries an `Any` whose
+//! `type_url` is `sf.tron.type.v1.Block` and whose `value` is the
+//! prost-encoded block — header, transactions, contracts (typed
+//! payloads for the four high-volume contract kinds + raw bytes for
+//! everything else). The `Transaction.info` field (logs, internal
+//! txs, resource accounting) is unset in v0.1 because the ingest
+//! pipeline doesn't yet fetch java-tron's
+//! `getTransactionInfoByBlockNum` side channel; that's a follow-up
+//! that drops in without a wire change.
 
 use std::pin::Pin;
 
@@ -33,18 +37,15 @@ use lightcycle_proto::firehose::v2::{
     Request, Response,
 };
 use lightcycle_relayer::Output;
+use prost::Message;
 use prost_types::{Any, Timestamp};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
 use tracing::{debug, warn};
 
+use crate::encode::{encode_block, BLOCK_TYPE_URL};
 use crate::hub::Hub;
-
-/// Placeholder type_url on `Response.block`. Will change when the
-/// chain-specific TRON block proto lands. Documented as v0 so
-/// consumers can detect and warn.
-const PLACEHOLDER_BLOCK_TYPE_URL: &str = "type.lightcycle.io/v0.LightcycleBlockPlaceholder";
 
 /// Stream service. Holds a clone of the hub so each `blocks` RPC
 /// call subscribes to the live broadcast.
@@ -153,11 +154,14 @@ fn output_to_response(output: Output) -> Response {
         time: Some(timestamp_from_ms(sb.block.decoded.header.timestamp_ms)),
     };
 
+    let block_pb = encode_block(&sb.block);
+    let block_any = Any {
+        type_url: BLOCK_TYPE_URL.into(),
+        value: block_pb.encode_to_vec(),
+    };
+
     Response {
-        block: Some(Any {
-            type_url: PLACEHOLDER_BLOCK_TYPE_URL.into(),
-            value: vec![],
-        }),
+        block: Some(block_any),
         step: step as i32,
         cursor: hex::encode(sb.cursor.to_bytes()),
         metadata: Some(metadata),
@@ -279,5 +283,23 @@ mod tests {
         let bytes = hex::decode(&r.cursor).expect("hex");
         let parsed = Cursor::from_bytes(&bytes).expect("parse");
         assert_eq!(parsed.height, 100);
+    }
+
+    #[test]
+    fn response_block_carries_sf_tron_payload() {
+        // The placeholder Any was replaced by a real
+        // sf.tron.type.v1.Block payload. Assert the type_url + that the
+        // value bytes round-trip through prost back to a Block whose
+        // height matches the synthetic source.
+        use lightcycle_proto::sf::tron::type_v1 as tron_v1;
+        use prost::Message;
+
+        let r = output_to_response(synth_output(Step::New, 82_500_999));
+        let any = r.block.expect("block any");
+        assert_eq!(any.type_url, BLOCK_TYPE_URL);
+        assert!(!any.value.is_empty(), "block payload must not be empty");
+        let decoded = tron_v1::Block::decode(any.value.as_slice()).expect("decode");
+        assert_eq!(decoded.number, 82_500_999);
+        assert!(decoded.header.is_some());
     }
 }

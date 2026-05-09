@@ -1,0 +1,328 @@
+// `sf.tron.type.v1` — TRON block payload that lightcycle ships on the
+// Firehose v2 `Response.block` field.
+//
+// This is OUR proto, not vendored from streamingfast. It mirrors the
+// shape of `lightcycle_codec::DecodedBlock` + `DecodedTransaction` +
+// `DecodedTxInfo` so consumers (Substreams modules, Kafka sinks, etc.)
+// get a structured view without having to decode java-tron's wire
+// format themselves.
+//
+// Design rules:
+//
+//   - The four high-volume contract types (`Transfer`, `TransferAsset`,
+//     `TriggerSmartContract`, `CreateSmartContract`) get fully decoded
+//     payloads. Everything else lands in `Contract.other_payload`
+//     with the raw `Any.value` bytes preserved + a `kind` tag, so a
+//     consumer that cares about (say) `FreezeBalanceV2Contract` can
+//     decode it locally against java-tron's protobuf.
+//
+//   - `TransactionInfo` (logs, internal txs, resource accounting) is
+//     a *separate fetch* from java-tron's side channel
+//     (`getTransactionInfoByBlockNum`). v0.1 of the ingest pipeline
+//     does not fetch it; the proto carries an `info` field set to
+//     unset/empty so the wire shape stays forward-compatible. When
+//     the ingest path is extended, no proto change is needed —
+//     existing consumers just start seeing populated `info`.
+//
+//   - All address bytes are 21-byte raw form (1-byte network prefix +
+//     20-byte hash). Consumers that want base58check ("T..." form)
+//     do the encoding themselves; we don't double-allocate strings on
+//     the wire.
+//
+//   - All hashes (block id, parent id, tx id, raw_data_hash, etc.) are
+//     32 raw bytes. Consumers that want hex stringify themselves.
+//
+//   - Timestamps live in two forms: the block's `time`
+//     (`google.protobuf.Timestamp`, matches Firehose v2's
+//     `BlockMetadata.time`) and per-tx `timestamp_ms` /
+//     `expiration_ms` raw int64s (matches what java-tron's wire
+//     `Transaction.raw_data` carries, no conversion overhead).
+
+syntax = "proto3";
+
+package sf.tron.type.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// A decoded TRON block. The unit lightcycle emits to downstream
+// Firehose subscribers.
+message Block {
+  // `BlockHeader.raw_data.number`. java-tron's wire is i64 but
+  // mainnet has never been negative; we widen to u64 for ergonomics.
+  uint64 number = 1;
+
+  // 32-byte canonical block id: 8-byte BE height || trailing 24
+  // bytes of `sha256(raw_data)`. This is the form java-tron's wire
+  // `parent_hash` carries; the relayer uses it for chain-linking.
+  bytes id = 2;
+
+  // 32-byte parent block id (same encoding).
+  bytes parent_id = 3;
+
+  // Block production time. Sourced from `raw_data.timestamp` (ms
+  // since epoch) and converted to Timestamp; consumers that want
+  // millis can reconstruct.
+  google.protobuf.Timestamp time = 4;
+
+  // Header fields beyond the height/ids/time the canonical
+  // BlockMetadata already carries.
+  Header header = 5;
+
+  // Transactions in the order java-tron included them in the block.
+  // Empty for empty blocks.
+  repeated Transaction transactions = 6;
+}
+
+// Block header fields that aren't already carried verbatim on the
+// outer Block message (number, id, parent_id, time live there).
+message Header {
+  // `raw_data.version` — TRON protocol version tag. Surfaced for
+  // upgrade-detection use cases.
+  int32 version = 1;
+
+  // `sha256(raw_data)` — the unprefixed digest. Distinct from the
+  // block id (which is height-prefixed). This is what the SR signs,
+  // so consumers verifying signatures themselves use this as the
+  // recovery prehash.
+  bytes raw_data_hash = 2;
+
+  // `raw_data.tx_trie_root` — Merkle root of the transactions list.
+  // Consumers that want to recompute and verify the root over the
+  // emitted `transactions` use this as the claim.
+  bytes tx_trie_root = 3;
+
+  // 21-byte raw address of the witness (super representative) that
+  // produced this block.
+  bytes witness = 4;
+
+  // Witness signature over `raw_data`. ~75% of mainnet SRs sign with
+  // secp256k1 + sha256; ~25% with SM2 (China's GM/T 0003 standard,
+  // separate curve, separate hash). The relayer's sigverify handles
+  // the secp256k1 path; SM2 verification is consumer-side until v0.2
+  // (see ARCHITECTURE.md "dual-engine SRs"). The signature bytes are
+  // the same wire shape regardless of which engine signed.
+  bytes witness_signature = 5;
+}
+
+// A decoded transaction.
+message Transaction {
+  // 32-byte sha256 of `raw_data`. Stable identifier; matches what
+  // java-tron's `txID` returns over RPC and what `getEventsByTxId`
+  // looks up.
+  bytes id = 1;
+
+  // `raw_data.timestamp` (ms since epoch).
+  int64 timestamp_ms = 2;
+
+  // `raw_data.expiration` (ms since epoch). Txs past expiration are
+  // rejected by the network; preserved here for replay-debugging
+  // visibility.
+  int64 expiration_ms = 3;
+
+  // `raw_data.fee_limit` — sun (1 TRX = 1e6 sun). 0 means "no limit"
+  // for non-contract txs.
+  int64 fee_limit_sun = 4;
+
+  // Per-contract decoded payload. TRON's wire schema permits multi-
+  // contract txs; mainnet activity is single-contract, but consumers
+  // must iterate.
+  repeated Contract contracts = 5;
+
+  // Witness/SR/multisig signatures. Length 1 in the common case;
+  // multisig accounts emit one per authorizer.
+  repeated bytes signatures = 6;
+
+  // Side-channel `TransactionInfo` (logs, internal txs, resource
+  // accounting). v0.1 of the ingest pipeline does NOT fetch this;
+  // the field is left unset. When ingest is extended to call
+  // `getTransactionInfoByBlockNum`, existing consumers just start
+  // seeing populated `info` without any wire change.
+  TransactionInfo info = 7;
+}
+
+// A typed contract payload. The four high-volume types carry decoded
+// fields directly; everything else lands in `other_payload` with the
+// raw `Any.value` bytes preserved.
+message Contract {
+  // Contract kind. Maps to java-tron's wire `ContractType` plus an
+  // OTHER fall-through for forward-compat with TRON forks that add a
+  // new contract type ahead of our vendor pin.
+  ContractKind kind = 1;
+
+  // Raw `ContractType` tag from the wire when `kind == OTHER` — lets
+  // consumers tell `WitnessCreate` apart from `MarketSellAsset`
+  // without our enum needing to enumerate all 40+ types. 0 when
+  // `kind` is one of the explicitly-handled values.
+  int32 unknown_kind = 2;
+
+  // Decoded payload for the four high-volume types; raw bytes for
+  // everything else.
+  oneof payload {
+    Transfer transfer = 10;
+    TransferAsset transfer_asset = 11;
+    TriggerSmartContract trigger_smart_contract = 12;
+    CreateSmartContract create_smart_contract = 13;
+    // Original `Contract.parameter.value` bytes (the inner Any
+    // payload). Empty for contracts whose parameter was unset.
+    bytes other_payload = 14;
+  }
+}
+
+// Lightweight kind tag mirroring the four explicitly-decoded
+// contract types plus an OTHER fall-through. Consumers filtering by
+// type without paying the full payload-decode cost match on this.
+enum ContractKind {
+  CONTRACT_KIND_UNSPECIFIED = 0;
+  CONTRACT_KIND_TRANSFER = 1;
+  CONTRACT_KIND_TRANSFER_ASSET = 2;
+  CONTRACT_KIND_TRIGGER_SMART_CONTRACT = 3;
+  CONTRACT_KIND_CREATE_SMART_CONTRACT = 4;
+  CONTRACT_KIND_OTHER = 99;
+}
+
+// `TransferContract` — TRX transfer.
+message Transfer {
+  bytes owner = 1;
+  bytes to = 2;
+  // Amount in sun (1 TRX = 1e6 sun).
+  int64 amount_sun = 3;
+}
+
+// `TransferAssetContract` — TRC-10 token transfer. Distinct from
+// TRC-20 (which is a `TriggerSmartContract` to an ERC-20-shaped
+// contract); TRC-10 is a native token type.
+message TransferAsset {
+  bytes owner = 1;
+  bytes to = 2;
+  // Post-`ALLOW_SAME_TOKEN_NAME`: string-encoded numeric token id.
+  // Pre-proposal: token name. Surfaced as raw bytes; consumers
+  // interpret based on the proposal-active flag they track.
+  bytes asset_name = 3;
+  int64 amount = 4;
+}
+
+// `TriggerSmartContract` — call into a deployed contract. The bulk
+// of mainnet activity flows through here (TRC-20 transfers, DEX,
+// USDT issuance).
+message TriggerSmartContract {
+  bytes owner = 1;
+  bytes contract_address = 2;
+  // ABI-encoded function selector + args. Consumers needing a
+  // structured view supply the contract's ABI; the universal
+  // TRC-20/TRC-721 events are emitted as `TransactionInfo.logs`
+  // and recognized by topic hash.
+  bytes data = 3;
+  // TRX value attached to the call (sun).
+  int64 call_value_sun = 4;
+  // TRC-10 token value attached to the call.
+  int64 call_token_value = 5;
+  // TRC-10 token id (when `call_token_value > 0`).
+  int64 token_id = 6;
+}
+
+// `CreateSmartContract` — deploy a new contract. We surface the
+// deploy parameters but not the full ABI tree (kept as part of the
+// on-chain `SmartContract.abi` proto, fetchable via `getContract`).
+message CreateSmartContract {
+  bytes owner = 1;
+  // Set by java-tron after deploy. Empty bytes on a fresh tx that
+  // hasn't been executed yet.
+  bytes contract_address = 2;
+  string name = 3;
+  bytes bytecode = 4;
+  // 0..100. Percent of energy the user pays vs. the contract's
+  // origin pays (when origin has a stake).
+  int64 consume_user_resource_percent = 5;
+  int64 origin_energy_limit = 6;
+  // TRC-10 sent with the deploy (rare).
+  int64 call_token_value = 7;
+  int64 token_id = 8;
+}
+
+// Side-channel `TransactionInfo` java-tron emits for every executed
+// tx. Lives on the `Transaction.info` field; populated by the
+// relayer when the side channel is fetched and joined.
+message TransactionInfo {
+  // True iff `result == SUCCESS` on the wire. False means the EVM
+  // reverted or the contract pre-check failed; the tx is still in
+  // the block, just with no state change.
+  bool success = 1;
+  // Total fee paid in sun. Already reflects energy/bandwidth net of
+  // staked resources.
+  int64 fee_sun = 2;
+  // Contract address for `TriggerSmartContract` / `CreateSmartContract`
+  // txs. Empty for non-contract txs.
+  bytes contract_address = 3;
+  // Per-tx resource consumption + fee breakdown.
+  ResourceCost resource = 4;
+  // EVM event logs emitted during execution, in emit order.
+  repeated Log logs = 5;
+  // Sub-calls the EVM made internally. Only populated when the tx
+  // hit a smart contract.
+  repeated InternalTx internal_transactions = 6;
+}
+
+// EVM event log. Topics + data are raw bytes; consumers supply their
+// own ABI registry to decode parameter values. The two universal
+// TRC-20 events (`Transfer`, `Approval`) are recognized by topic-0
+// hash without a registry — see `lightcycle_codec::events`.
+message Log {
+  // 21-byte address of the emitting contract.
+  bytes address = 1;
+  // Indexed event parameters. `topics[0]` is the event-signature
+  // hash for non-anonymous events. Each topic is exactly 32 bytes;
+  // shorter wire topics are left-padded with zero (matches geth).
+  repeated bytes topics = 2;
+  // Non-indexed event parameters, ABI-encoded.
+  bytes data = 3;
+}
+
+// Internal transaction: sub-call surfaced by the EVM during the
+// outer tx's execution. `rejected = true` calls reverted.
+message InternalTx {
+  // 32-byte hash identifying this internal tx; tree-rooted so the
+  // root internal-tx hash equals the outer tx id.
+  bytes hash = 1;
+  // 21-byte address that initiated this sub-call.
+  bytes caller = 2;
+  // 21-byte recipient.
+  bytes transfer_to = 3;
+  // Value transfers attached to this sub-call. Empty in the common
+  // case — most internal calls don't move TRX.
+  repeated CallValue call_values = 4;
+  // True iff this sub-call reverted. The outer tx may still have
+  // succeeded if a parent frame caught the revert.
+  bool rejected = 5;
+  // Free-form note java-tron attaches (typically the precompile or
+  // opcode tag, e.g. "call", "create", "suicide"). Empty for most.
+  bytes note = 6;
+}
+
+// One entry of `InternalTx.call_values`. `token_id == ""` means TRX;
+// otherwise the value is denominated in the named TRC-10 token.
+message CallValue {
+  int64 call_value = 1;
+  string token_id = 2;
+}
+
+// Resource accounting for a tx's execution. Mirrors java-tron's
+// `ResourceReceipt`; consumers computing TRX cost or staking
+// efficiency want the full breakdown.
+message ResourceCost {
+  // Energy spent by this tx (excluding origin energy).
+  int64 energy_usage = 1;
+  // Energy paid for in TRX (sun) when staked energy was insufficient.
+  int64 energy_fee = 2;
+  // Energy donated by the contract owner via origin-energy-limit.
+  int64 origin_energy_usage = 3;
+  // Total energy: `energy_usage + origin_energy_usage`. Pre-computed
+  // by java-tron; surfaced rather than recomputed.
+  int64 energy_usage_total = 4;
+  // Bandwidth (net) bytes consumed.
+  int64 net_usage = 5;
+  // Bandwidth fee in sun (when staked bandwidth was insufficient).
+  int64 net_fee = 6;
+  // Penalty energy charged when contracts violate energy limits.
+  // Mostly zero on mainnet; surfaced for completeness.
+  int64 energy_penalty_total = 7;
+}

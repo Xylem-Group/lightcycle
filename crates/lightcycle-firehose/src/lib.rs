@@ -21,16 +21,20 @@
 //! - `Fetch.Block` (point-in-time block lookup)
 //! - `Stream.Blocks` backfill via `cursor` or `start_block_num`
 //! - `final_blocks_only` and `transforms` request fields
-//! - Chain-specific block payload (`Response.block` is currently a
-//!   placeholder Any; consumers that need full block bytes should
-//!   call the upstream node directly until the TRON-flavored
-//!   `sf.tron.type.v1.Block` proto lands)
+//! - `TransactionInfo` side-channel join — the
+//!   [`sf.tron.type.v1.Block`] payload is fully populated for
+//!   header / transactions / contracts, but `Transaction.info`
+//!   (logs, internal txs, resource accounting) is unset because
+//!   ingest doesn't yet fetch `getTransactionInfoByBlockNum`. When
+//!   it does, no wire change is needed.
 
 #![allow(dead_code)]
 
+mod encode;
 mod hub;
 mod server;
 
+pub use encode::{encode_block, BLOCK_TYPE_URL};
 pub use hub::Hub;
 pub use server::{EndpointInfoService, StreamService};
 
