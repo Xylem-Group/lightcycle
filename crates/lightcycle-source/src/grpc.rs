@@ -15,14 +15,23 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use lightcycle_proto::tron::api::wallet_client::WalletClient;
+use lightcycle_proto::tron::api::wallet_solidity_client::WalletSolidityClient;
 use lightcycle_proto::tron::protocol::{Block, EmptyMessage, NumberMessage, TransactionInfoList};
-use lightcycle_types::{Address, SrSet};
+use lightcycle_types::{Address, BlockHeight, SrSet};
 use tonic::transport::Channel;
 
 /// Cheap clonable handle to a connected gRPC client.
+///
+/// Holds two service stubs that share a single underlying `Channel`:
+/// `Wallet` for the live head + tx-info path, and `WalletSolidity` for
+/// the chain's authoritative finality reading. We do not compute
+/// finality from a confirmation count — finality is read from the
+/// chain via `WalletSolidity.GetNowBlock` per ADR-0021's "the chain
+/// has a finality machine; lean on it" discipline.
 #[derive(Debug, Clone)]
 pub struct GrpcSource {
     client: WalletClient<Channel>,
+    solidity_client: WalletSolidityClient<Channel>,
 }
 
 impl GrpcSource {
@@ -38,7 +47,8 @@ impl GrpcSource {
             .await
             .with_context(|| format!("gRPC connect failed: {url}"))?;
         Ok(Self {
-            client: WalletClient::new(channel),
+            client: WalletClient::new(channel.clone()),
+            solidity_client: WalletSolidityClient::new(channel),
         })
     }
 
@@ -79,6 +89,43 @@ impl GrpcSource {
             .await
             .context("get_now_block rpc failed")?;
         Ok(resp.into_inner())
+    }
+
+    /// Fetch the chain's current solidified-head height. Reads from
+    /// `WalletSolidity.GetNowBlock` — java-tron's solidity service
+    /// returns the highest block past SR-supermajority confirmation
+    /// (~19 of 27 SRs, ~57s under healthy operation). This is the
+    /// chain's own finality machine; we never recompute it.
+    ///
+    /// Returns `None` only when the upstream node has produced zero
+    /// solidified blocks (cold start, or a freshly-initialized chain).
+    /// Open in BOTH FullNode and LiteFullNode modes.
+    ///
+    /// **Per ADR-0021 §2:** the value returned here is the only legal
+    /// consistency source for cross-replica or cross-region agreement
+    /// in lightcycle. Any caller answering "are these two replicas in
+    /// agreement?" must compare against this number, not against a
+    /// locally-computed confirmation count.
+    pub async fn fetch_solidified_head(&mut self) -> Result<Option<BlockHeight>> {
+        let resp = self
+            .solidity_client
+            .get_now_block(EmptyMessage {})
+            .await
+            .context("walletsolidity.get_now_block rpc failed")?
+            .into_inner();
+        let Some(header) = resp.block_header else {
+            return Ok(None);
+        };
+        let Some(raw) = header.raw_data else {
+            return Ok(None);
+        };
+        if raw.number < 0 {
+            anyhow::bail!(
+                "solidified head returned negative number ({}); chain-level bug",
+                raw.number,
+            );
+        }
+        Ok(Some(raw.number as BlockHeight))
     }
 
     /// Fetch the `TransactionInfo` side channel for every tx in a

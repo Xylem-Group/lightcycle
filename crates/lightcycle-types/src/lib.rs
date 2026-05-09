@@ -52,6 +52,13 @@ impl Address {
 }
 
 /// Streaming step semantics, matching Firehose's `ForkStep`.
+///
+/// `Step` is an *event tag* — what happened — not a block's state.
+/// A block's finality state is [`FinalityTier`]; the two are distinct
+/// and a block carries both. Example: a `Step::New` emission can carry
+/// a `FinalityTier::Seen`, `Confirmed`, or `Finalized` block depending
+/// on where the block sits relative to the chain's solidified head at
+/// emission time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Step {
     /// New canonical block.
@@ -60,6 +67,113 @@ pub enum Step {
     Undo,
     /// Block has crossed solidification (~19 confirmations on TRON).
     Irreversible,
+}
+
+/// Per-block finality state, derived from the chain's own SR-consensus
+/// reporting (NOT recomputed by us). Implements the discipline pinned in
+/// ADR-0021 (`alexandria/docs/adr/0021-consistency-horizons-and-the-distributed-verification-floor.md`):
+/// finality is read from the chain, never computed; the schema enforces
+/// the invariant in the spirit of ADR-0015 (`docs/adr/0015-multi-clock-time-model.md`).
+///
+/// Tier transitions are monotone in (block_height, solidified_head). A
+/// block moves Seen → Confirmed → Finalized; it never moves backward,
+/// and a Finalized block is by definition past reorg risk per the chain's
+/// own consensus.
+///
+/// **Failure modes (enumerate, ADR-0009 style):**
+///
+/// 1. *Solidified-head fetch fails.* Tier derivation degrades to
+///    Seen/Confirmed only — Finalized is gated on a fresh head reading.
+///    Soft-fail: emission continues with the last-known head until the
+///    next successful fetch. Logged + metered.
+/// 2. *Block height exceeds last-known solidified head.* Block is at
+///    most Confirmed. This is the steady-state head-of-chain regime.
+/// 3. *Sibling at the same height under unsolidified head.* Both
+///    candidates carry tier ≤ Confirmed. The engine emits a
+///    `ForkObserved` ledger entry and waits for the chain's solidified
+///    head to advance past the disagreement; whichever block is at
+///    `height ≤ solidified_head` *and matches the solidified-head's
+///    block_id by ancestry* is the survivor. We do not "decide" — we
+///    record the chain's resolution.
+/// 4. *Solidified head appears to regress.* Treated as a chain-level
+///    bug; surfaced as a typed error rather than silently accepted.
+///
+/// The wire mapping in `sf.tron.type.v1.Block.finality.tier` is the
+/// canonical external representation; this Rust enum is the source of
+/// truth for in-process code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FinalityTier {
+    /// Block has been received and parsed; no chain-finality claim yet.
+    /// Equivalent to "exists in the source's view of the canonical
+    /// chain" — NOT equivalent to "exists" for any cross-replica or
+    /// audit purpose.
+    Seen,
+    /// Block has been built upon by ≥1 subsequent block in the
+    /// engine's canonical buffer. A consensus checkpoint, but still
+    /// reorg-risk-bearing until Finalized.
+    Confirmed,
+    /// Block height ≤ the chain's solidified-head height as last
+    /// reported by `WalletSolidity.GetNowBlock`. This is the only tier
+    /// safe to use as a consistency source for cross-replica or
+    /// cross-region agreement (ADR-0021 §2).
+    Finalized,
+}
+
+impl FinalityTier {
+    /// Derive the tier of a block at `height` given the chain's last
+    /// reported solidified head and whether the engine has buffered
+    /// any descendant.
+    ///
+    /// Pure function over inputs — no I/O, no internal mutation, no
+    /// hidden state. Callers thread `solidified_head` from a chain
+    /// fetch (never from a local clock or a count we computed).
+    pub fn derive(
+        height: BlockHeight,
+        solidified_head: Option<BlockHeight>,
+        has_buffered_descendant: bool,
+    ) -> Self {
+        match solidified_head {
+            Some(s) if height <= s => FinalityTier::Finalized,
+            _ if has_buffered_descendant => FinalityTier::Confirmed,
+            _ => FinalityTier::Seen,
+        }
+    }
+
+    /// True if a block at this tier is past the chain's finality
+    /// threshold. The only legal answer to "is it safe to use this as
+    /// a cross-replica consistency source?" (ADR-0021 §2).
+    pub fn is_finalized(self) -> bool {
+        matches!(self, FinalityTier::Finalized)
+    }
+}
+
+/// The finality envelope a block carries on every emission. Pairs the
+/// derived tier with the chain's last-known solidified-head reference
+/// so consumers can both filter by tier and audit *what claim the
+/// chain made when we tagged this*. The reference is `None` until the
+/// engine has seen at least one successful solidified-head fetch from
+/// `WalletSolidity.GetNowBlock` (cold-start window or upstream-RPC
+/// failure regime — see [`FinalityTier`] failure modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockFinality {
+    pub tier: FinalityTier,
+    pub solidified_head: Option<BlockHeight>,
+}
+
+impl BlockFinality {
+    /// Build a finality envelope for a block at `height`, given the
+    /// chain's last-known solidified head and whether the engine has
+    /// at least one buffered descendant of this block.
+    pub fn for_block(
+        height: BlockHeight,
+        solidified_head: Option<BlockHeight>,
+        has_buffered_descendant: bool,
+    ) -> Self {
+        Self {
+            tier: FinalityTier::derive(height, solidified_head, has_buffered_descendant),
+            solidified_head,
+        }
+    }
 }
 
 /// Opaque cursor for stream resumption. Encodes `(height, blockId, forkId)`.
@@ -144,6 +258,58 @@ mod tests {
         let bad = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6T";
         let err = Address::from_base58check(bad).unwrap_err();
         assert!(matches!(err, Error::InvalidAddress(_)));
+    }
+
+    #[test]
+    fn finality_tier_below_solidified_head_is_finalized() {
+        // ADR-0021 invariant: tier=Finalized iff the chain says so.
+        let t = FinalityTier::derive(100, Some(105), false);
+        assert_eq!(t, FinalityTier::Finalized);
+        assert!(t.is_finalized());
+    }
+
+    #[test]
+    fn finality_tier_at_solidified_head_is_finalized() {
+        // Boundary: height == solidified_head is finalized (the
+        // solidified head is itself solidified).
+        assert_eq!(
+            FinalityTier::derive(105, Some(105), false),
+            FinalityTier::Finalized,
+        );
+    }
+
+    #[test]
+    fn finality_tier_above_head_with_descendant_is_confirmed() {
+        // Past the solidified head but with a child built on top —
+        // the engine's strongest local claim short of chain finality.
+        assert_eq!(
+            FinalityTier::derive(110, Some(105), true),
+            FinalityTier::Confirmed,
+        );
+    }
+
+    #[test]
+    fn finality_tier_above_head_without_descendant_is_seen() {
+        // Tip-of-buffer: no children yet, head not advanced past us.
+        assert_eq!(
+            FinalityTier::derive(110, Some(105), false),
+            FinalityTier::Seen,
+        );
+    }
+
+    #[test]
+    fn finality_tier_without_known_head_never_finalizes() {
+        // Failure-mode #1: solidified-head fetch failed; we have no
+        // chain claim. Best we can say is Confirmed (with descendant)
+        // or Seen. NEVER Finalized.
+        assert_eq!(
+            FinalityTier::derive(100, None, true),
+            FinalityTier::Confirmed,
+        );
+        assert_eq!(
+            FinalityTier::derive(100, None, false),
+            FinalityTier::Seen,
+        );
     }
 
     #[test]
