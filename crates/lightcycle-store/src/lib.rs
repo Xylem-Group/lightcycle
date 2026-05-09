@@ -1,20 +1,73 @@
 //! Block cache + cursor store for lightcycle.
 //!
-//! Stub. The real surface lands incrementally; see SCAFFOLD.md priority 5.
-//! Three pieces planned (in order of build-out):
+//! ## Consistency posture (ADR-0021)
 //!
-//! 1. **Block cache** — last N unsolidified blocks held in memory for
+//! `lightcycle-store` is the persistence layer; future work wires it
+//! across replicas (block cache, cursor store, SR-set checkpoints).
+//! This crate is constitutionally bound by ADR-0021 ("Consistency
+//! horizons and the distributed-verification floor"):
+//!
+//! - **Chain finality is the only legal cross-replica consistency
+//!   source.** When two replicas of `lightcycle-store` disagree about
+//!   the head, the resolution is "wait for chain finality and use the
+//!   chain's answer" — see [`ConsistencySource`]. We do NOT build a
+//!   custom Raft / Paxos / quorum protocol; the chain's SR consensus
+//!   already solves the verification problem and the Das Sarma
+//!   round-complexity floor (`~/h/sarma2012-implications.md` §6) makes
+//!   any locally-engineered alternative provably worse.
+//! - **`as_of(now)` reads against in-memory state require an explicit
+//!   staleness tolerance** (ADR-0021 §8). Reads against finalized
+//!   storage do not — finalized records are by construction past the
+//!   chain's finality window.
+//! - **`SEEN ≠ EXISTS` for any cross-replica purpose.** A block that
+//!   one replica has SEEN is a candidate for finalization, not a
+//!   committed fact. Only `FinalityTier::Finalized` records are safe
+//!   to use as a cross-replica truth.
+//!
+//! Failure modes (ADR-0009 style enumeration):
+//!
+//! 1. *Chain solidified-head fetch fails for >5 min sustained.* The
+//!    SLO histogram (`lightcycle_store_block_seen_to_finalized_seconds`)
+//!    breaches; alert fires per [`describe_metrics`]. The relayer
+//!    keeps streaming with `tier=Seen|Confirmed`; no `Finalized`
+//!    transitions happen until the chain RPC recovers. Replicas in
+//!    this regime MUST NOT make cross-replica agreement decisions.
+//! 2. *Two replicas observe different `Seen` tips.* By construction
+//!    expected behavior — heads can diverge on the order of the
+//!    chain's reorg window. Resolution is automatic: when finalized
+//!    transitions arrive (chain solidifies), both replicas converge.
+//!    No engineering intervention required.
+//! 3. *Replica observes a finalized transition from the relayer that
+//!    a peer replica disagrees with.* This is a chain-level oddity
+//!    (the chain reported different solidified heights to the two
+//!    relayers). Surfaces as a divergence in
+//!    `lightcycle_store_finalized_height` gauge; investigate the
+//!    peer's java-tron, do NOT attempt to reconcile in software.
+//!
+//! ## Components (incremental build-out, see SCAFFOLD.md priority 5)
+//!
+//! 1. **[`ConsistencyHorizonObserver`]** — measures the
+//!    `seen → finalized` latency that ADR-0021 §"consistency-horizon
+//!    SLO" mandates for lightcycle. Currently the only landed surface;
+//!    the relayer feeds it observations.
+//!
+//! 2. **Block cache** — last N unsolidified blocks held in memory for
 //!    reorg replay, with spill to `redb` when N grows. The reorg engine
 //!    in `lightcycle-relayer` walks this on canonical-chain switches.
+//!    Not yet wired.
 //!
-//! 2. **Cursor store** — per-consumer `{height, blockId, forkId}`
+//! 3. **Cursor store** — per-consumer `{height, blockId, forkId}`
 //!    checkpoints, persisted so a consumer reconnect after a process
 //!    restart resumes deterministically. Optional in v0.1; useful later
-//!    for ops dashboards.
+//!    for ops dashboards. Not yet wired.
 //!
-//! 3. **SR set checkpoints** — trusted starting point + maintenance-period
+//! 4. **SR set checkpoints** — trusted starting point + maintenance-period
 //!    diffs of the active witness set. Cold restarts re-derive from the
-//!    nearest checkpoint instead of replaying from genesis.
-//!
-//! The crate exists in the workspace now so dependent crates
-//! (`lightcycle-relayer`, `lightcycle-firehose`) can already import it.
+//!    nearest checkpoint instead of replaying from genesis. Not yet wired.
+
+mod consistency;
+
+pub use consistency::{
+    describe_metrics, ConsistencyHorizonObserver, ConsistencySource, FinalityFromChain,
+    BLOCK_SEEN_TO_FINALIZED_SECONDS_METRIC,
+};

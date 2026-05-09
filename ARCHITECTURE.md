@@ -75,7 +75,8 @@ Pure CPU, no I/O. Takes raw protobuf bytes, returns structured types.
 The orchestrator. Owns the canonical head pointer and the live block buffer.
 
 - **Reorg engine**: maintains the last N unsolidified blocks (`N ≈ 30` covers TRON's longest realistic reorg). When the canonical head changes, emits `UNDO` for orphaned blocks before `NEW` for the new branch. Consumers can build correct materialized state without reasoning about TRON's solidification rules themselves.
-- **Finality tagging**: marks blocks `IRREVERSIBLE` once they cross the solidified head (~19 of 27 confirmations, ~57 seconds).
+- **Finality tagging**: chain-driven. Per ADR-0021 (`alexandria/docs/adr/0021-consistency-horizons-and-the-distributed-verification-floor.md`), the engine reads the chain's solidified head from `WalletSolidity.GetNowBlock` every tick and emits `IRREVERSIBLE` only when a buffered block crosses that height. We do NOT compute finality from a confirmation count — the chain has its own SR-supermajority finality machine and we lean on it.
+- **Fork ledger**: on reorg, the engine emits an internal `ForkObserved` ledger entry naming the kept tip + the orphaned tips. When the chain's solidified head later advances past the observation, a corresponding `ForkResolved` entry records the chain's resolution. Together they form the audit ledger ADR-0021 §3 mandates: the engine never *decides* which fork wins, it records the chain's claim. Ledger entries flow through `tracing` logs + the `lightcycle_relay_outputs_total{step="fork_observed|fork_resolved"}` counter; they have no Firehose v2 wire shape (the v2 schema has no STATUS variant) so they don't ship over `Stream.Blocks`.
 - **Cursor management**: every emission carries an opaque cursor encoding `{height, blockId, forkId}`. Resumption is deterministic and reorg-correct.
 
 ### lightcycle-firehose
@@ -88,15 +89,32 @@ v0.1 ships **live mode only**: `Stream.Blocks` rejects requests carrying `cursor
 
 `Transaction.info` is populated from java-tron's `getTransactionInfoByBlockNum` side channel: per-tx logs, internal transactions, resource accounting, and success/fee. Default-on; CLI exposes `--fetch-tx-info=false` to halve the per-tick RPC cost when consumers don't read it. RPC failures soft-degrade (block ships with empty `tx_infos`; logged + counted as `lightcycle_relay_tx_info_fetch_total{result="rpc_error"}`) rather than halting the stream. Encoder joins by tx hash so wire ordering doesn't matter.
 
-The proto schema lives at `proto/sf/tron/type/v1/block.proto` and is compiled into `lightcycle_proto::sf::tron::type_v1`. The encoder (`lightcycle_firehose::encode_block`) maps `BufferedBlock` → wire proto in pure CPU.
+`Block.finality` carries the chain-reported finality envelope per ADR-0021 §1: a `tier` enum (`SEEN | CONFIRMED | FINALIZED`) plus the `solidified_head_number` the tier was derived against. Consumers that need only "safe to use as a cross-replica truth" filter on `tier == FINALIZED`. The Firehose v2 `Response.metadata.lib_num` is sourced from the same solidified-head value, so dashboards and orchestrators see the chain's claim, not a count we computed.
+
+The proto schema lives at `proto/sf/tron/type/v1/block.proto` and is compiled into `lightcycle_proto::sf::tron::type_v1`. The encoder (`lightcycle_firehose::encode_block`) maps `BufferedBlock` + `BlockFinality` → wire proto in pure CPU.
 
 ### lightcycle-store
 
-Local persistence:
+Local persistence + the consistency-horizon SLO. Per ADR-0021, this crate is constitutionally bound to chain-finality as the only legal cross-replica consistency source — no Raft / Paxos / custom-quorum shims (the chain's SR consensus already solves the verification problem and the Das Sarma round-complexity floor makes any locally-engineered alternative provably worse).
 
-- **Block cache**: recent N blocks for reorg replay, in-memory with spill to `redb`.
-- **Cursor store**: per-consumer cursor checkpoints (optional, mostly for ops dashboards).
-- **SR set checkpoints**: trusted starting point + maintenance-period diffs, so cold restarts don't have to re-derive the whole history.
+- **Consistency-horizon SLO** (landed): `ConsistencyHorizonObserver` records `seen_at` per block id when the relayer first surfaces a `tier=Seen` block, then closes the loop on the `tier=Finalized` transition by observing the elapsed wall-clock time into `lightcycle_store_block_seen_to_finalized_seconds`. **Target: p99 ≤ 5s under healthy operation; alert if >5s sustained for >5 min.** Exported via the standard prometheus exporter (`lightcycle relay --metrics-listen ...`).
+- **Block cache** (planned): recent N blocks for reorg replay, in-memory with spill to `redb`.
+- **Cursor store** (planned): per-consumer cursor checkpoints (optional, mostly for ops dashboards).
+- **SR set checkpoints** (planned): trusted starting point + maintenance-period diffs, so cold restarts don't have to re-derive the whole history.
+
+Future cross-replica work must implement `lightcycle_store::ConsistencySource`. The blessed implementation is `FinalityFromChain` (snapshots the relayer's view of the chain's solidified head). Reviewers proposing alternatives should be redirected to ADR-0021.
+
+## Finality discipline (ADR-0021)
+
+`lightcycle` treats the TRON chain's own SR-supermajority finality machine as the consistency source for any global question — "what's the head?", "are these two replicas in agreement?", "which fork is canonical?" — and never recomputes it. This is the core architectural posture of ADR-0021 (`alexandria/docs/adr/0021-consistency-horizons-and-the-distributed-verification-floor.md`), which itself follows from the Das Sarma (2012) round-complexity floor on distributed verification: any locally-engineered cross-replica agreement protocol has a provable lower bound that no engineering optimization removes, while the chain already provides a finality machine for free.
+
+Three load-bearing rules implement this discipline.
+
+1. **Finality is read, never computed.** Every tick, the relayer fetches `WalletSolidity.GetNowBlock` and pushes the solidified-head height into the reorg engine via `set_solidified_head`. `Output::Irreversible` fires only when a buffered block crosses that head. There is no confirmation-count threshold; a hard-coded "19 of 27" rule would be a Das Sarma-style verification claim we made ourselves rather than reading from the chain.
+2. **Reorgs are observed, not decided.** When the source surfaces a competing tip, the engine performs an optimistic switch (Undo of orphans, New of the new tip) and emits a `ForkObserved` ledger entry naming both. The engine does not "decide" which fork is canonical — when the chain's solidified head later advances past the observation, a `ForkResolved` entry records the chain's resolution. The two together constitute the structured ledger of fork events that ADR-0021 §3 mandates.
+3. **`tier=Seen` ≠ exists.** A block tagged Seen is a candidate for finalization, not a committed fact. Only `tier=Finalized` is safe to use as a cross-replica or cross-region truth. Future `lightcycle-store` cross-replica work must call into `ConsistencySource` (the only blessed implementation is `FinalityFromChain`), not invent a new agreement protocol.
+
+The consistency-horizon SLO `lightcycle_store_block_seen_to_finalized_seconds` measures the practical realization of this discipline — the wall-clock latency from a block being first observed to being finalized — and gates whether the chain-finality oracle is healthy. Target p99 ≤ 5s; alert if sustained breach.
 
 ## Trust model
 

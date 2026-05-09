@@ -14,6 +14,7 @@ path = "src/main.rs"
 lightcycle-relayer.workspace = true
 lightcycle-firehose.workspace = true
 lightcycle-source.workspace = true
+lightcycle-store.workspace = true
 lightcycle-types.workspace = true
 lightcycle-codec.workspace = true
 lightcycle-proto.workspace = true

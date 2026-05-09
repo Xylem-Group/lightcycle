@@ -327,6 +327,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         .install()
         .context("install prometheus exporter")?;
     lightcycle_relayer::describe_metrics();
+    lightcycle_store::describe_metrics();
     metrics::describe_gauge!(
         "lightcycle_info",
         "build info: always 1, with version + feature labels"
