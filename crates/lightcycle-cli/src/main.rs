@@ -25,7 +25,12 @@ struct Cli {
     /// at any position; the kulen oci-container module passes args after
     /// the subcommand because that's the natural shape for an
     /// argv-shaped `cmd = [...]` list.
-    #[arg(long, env = "RUST_LOG", default_value = "lightcycle=info,warn", global = true)]
+    #[arg(
+        long,
+        env = "RUST_LOG",
+        default_value = "lightcycle=info,warn",
+        global = true
+    )]
     log: String,
 
     /// Emit logs as plain text (default) or JSON. Same `global` rationale
@@ -114,7 +119,11 @@ struct RelayArgs {
     /// us 3 chances to catch each. Faster polling does not improve
     /// latency below the upstream's block production rate but does
     /// add load.
-    #[arg(long, env = "LIGHTCYCLE_RELAY_POLL_INTERVAL_MS", default_value_t = 1000)]
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_RELAY_POLL_INTERVAL_MS",
+        default_value_t = 1000
+    )]
     poll_interval_ms: u64,
 
     /// Verify policy: `disabled` skips sigverify entirely; `lenient`
@@ -138,11 +147,7 @@ struct RelayArgs {
     /// 7,200 blocks ≈ 6h; refreshing every 30 minutes catches an SR
     /// rotation without stale-set risk. Set to 0 to disable refresh
     /// (one-shot fetch at startup, suitable for runs <6h).
-    #[arg(
-        long,
-        env = "LIGHTCYCLE_RELAY_SR_REFRESH_SECS",
-        default_value_t = 1800
-    )]
+    #[arg(long, env = "LIGHTCYCLE_RELAY_SR_REFRESH_SECS", default_value_t = 1800)]
     sr_refresh_secs: u64,
 
     /// Bind the Firehose v2 gRPC server here. When set, every
@@ -385,9 +390,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         // source.
         let mut refresh_source = lightcycle_source::GrpcSource::connect(args.grpc_url.clone())
             .await
-            .with_context(|| {
-                format!("gRPC connect (refresh): {}", args.grpc_url)
-            })?;
+            .with_context(|| format!("gRPC connect (refresh): {}", args.grpc_url))?;
         let interval = std::time::Duration::from_secs(args.sr_refresh_secs);
         let tx = sr_set_tx.clone();
         Some(tokio::spawn(async move {
@@ -463,12 +466,9 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         // out of phase with the tick loop). Sharing the connection
         // would serialize Fetch behind the live-tail mutex and add
         // latency tail at no benefit. Costs one extra gRPC channel.
-        let oracle_source =
-            lightcycle_source::GrpcSource::connect(args.grpc_url.clone())
-                .await
-                .with_context(|| {
-                    format!("gRPC connect (Fetch.Block oracle): {}", args.grpc_url)
-                })?;
+        let oracle_source = lightcycle_source::GrpcSource::connect(args.grpc_url.clone())
+            .await
+            .with_context(|| format!("gRPC connect (Fetch.Block oracle): {}", args.grpc_url))?;
         let oracle: lightcycle_firehose::SharedBlockOracle =
             std::sync::Arc::new(GrpcBlockOracle::new(oracle_source));
 
@@ -476,16 +476,11 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         let chain_name = args.firehose_chain_name.clone();
         let hub_for_serve = hub.clone();
         let server_handle = tokio::spawn(async move {
-            if let Err(e) = lightcycle_firehose::serve(
-                listen,
-                hub_for_serve,
-                oracle,
-                chain_name,
-                async move {
+            if let Err(e) =
+                lightcycle_firehose::serve(listen, hub_for_serve, oracle, chain_name, async move {
                     let _ = server_shutdown_rx.await;
-                },
-            )
-            .await
+                })
+                .await
             {
                 tracing::error!(error = %e, "firehose server exited with error");
             }
@@ -563,8 +558,12 @@ impl lightcycle_firehose::BlockOracle for GrpcBlockOracle {
     async fn fetch_block_by_number(
         &self,
         height: u64,
-    ) -> anyhow::Result<Option<(lightcycle_relayer::BufferedBlock, lightcycle_types::BlockFinality)>>
-    {
+    ) -> anyhow::Result<
+        Option<(
+            lightcycle_relayer::BufferedBlock,
+            lightcycle_types::BlockFinality,
+        )>,
+    > {
         let mut src = self.source.lock().await;
 
         let block_msg = match src.fetch_block(height).await {
@@ -606,11 +605,8 @@ impl lightcycle_firehose::BlockOracle for GrpcBlockOracle {
         // block is at-or-below the chain's solidified head). Confirmed
         // is reserved for blocks whose buffered-descendant state is
         // known, which is a Stream.Blocks concern.
-        let finality = lightcycle_types::BlockFinality::for_block(
-            buffered.height,
-            solidified_head,
-            false,
-        );
+        let finality =
+            lightcycle_types::BlockFinality::for_block(buffered.height, solidified_head, false);
         Ok(Some((buffered, finality)))
     }
 }
@@ -664,15 +660,27 @@ async fn run_inspect(args: InspectArgs) -> Result<()> {
     }
 
     println!("height           : {}", decoded.header.height);
-    println!("block_id         : 0x{}", hex::encode(decoded.header.block_id.0));
-    println!("parent_id        : 0x{}", hex::encode(decoded.header.parent_id.0));
+    println!(
+        "block_id         : 0x{}",
+        hex::encode(decoded.header.block_id.0)
+    );
+    println!(
+        "parent_id        : 0x{}",
+        hex::encode(decoded.header.parent_id.0)
+    );
     println!(
         "tx_trie_root     : 0x{}",
         hex::encode(decoded.header.tx_trie_root)
     );
     println!("timestamp_ms     : {}", decoded.header.timestamp_ms);
-    println!("witness          : 0x{}", hex::encode(decoded.header.witness.0));
-    println!("witness_sig_len  : {} bytes", decoded.header.witness_signature.len());
+    println!(
+        "witness          : 0x{}",
+        hex::encode(decoded.header.witness.0)
+    );
+    println!(
+        "witness_sig_len  : {} bytes",
+        decoded.header.witness_signature.len()
+    );
     println!("version          : {}", decoded.header.version);
     println!("transactions     : {}", decoded.transactions.len());
     if !by_kind.is_empty() {

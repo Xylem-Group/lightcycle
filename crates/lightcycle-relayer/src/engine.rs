@@ -761,8 +761,8 @@ mod tests {
         }
         // Now arrive a sibling 102b, parent = 101a. Should UNDO 102a +
         // NEW 102b + ForkObserved (the audit ledger entry).
-        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
-            .expect("accept reorg");
+        let outs =
+            accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa))).expect("accept reorg");
         let undo_new: Vec<_> = outs
             .iter()
             .filter(|o| matches!(o, Output::Undo(_) | Output::New(_)))
@@ -791,8 +791,7 @@ mod tests {
         }
         // Branch from 101a: arrive a single new block at height 102b.
         // Should UNDO 103a then UNDO 102a then NEW 102b.
-        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
-            .expect("accept");
+        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa))).expect("accept");
         let kinds: Vec<_> = outs
             .iter()
             .filter_map(|o| match o {
@@ -804,10 +803,7 @@ mod tests {
                 Output::ForkObserved { .. } | Output::ForkResolved { .. } => None,
             })
             .collect();
-        assert_eq!(
-            kinds,
-            vec![("undo", 103), ("undo", 102), ("new", 102)],
-        );
+        assert_eq!(kinds, vec![("undo", 103), ("undo", 102), ("new", 102)],);
     }
 
     #[test]
@@ -825,8 +821,7 @@ mod tests {
         // becomes 103, so any reorg whose orphan tail reaches 103 or
         // below is refused.
         let _ = e.set_solidified_head(103);
-        let err = accept(&mut e, synth_block(103, id(103, 0xb), id(102, 0xa)))
-            .unwrap_err();
+        let err = accept(&mut e, synth_block(103, id(103, 0xb), id(102, 0xa))).unwrap_err();
         assert!(
             matches!(err, ReorgError::ReorgBelowFinality { .. }),
             "expected ReorgBelowFinality, got {err:?}"
@@ -840,8 +835,7 @@ mod tests {
         let mut e = small_engine();
         accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0))).unwrap();
         // Skip 101; deliver 102 with parent 101 (which we never saw).
-        let err = accept(&mut e, synth_block(102, id(102, 0xa), id(101, 0xa)))
-            .unwrap_err();
+        let err = accept(&mut e, synth_block(102, id(102, 0xa), id(101, 0xa))).unwrap_err();
         match err {
             ReorgError::ParentNotInBuffer {
                 height: 102,
@@ -880,8 +874,7 @@ mod tests {
     #[test]
     fn cursor_carries_height_and_block_id() {
         let mut e = small_engine();
-        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0)))
-            .unwrap();
+        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0))).unwrap();
         match &outs[0] {
             Output::New(s) => {
                 assert_eq!(s.cursor.height, 100);
@@ -899,8 +892,7 @@ mod tests {
             accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
-        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
-            .unwrap();
+        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa))).unwrap();
         // Find the New(102b) and confirm its fork_id differs from
         // whatever 102a got. We don't assert specific values (the
         // counter is implementation detail) — just that they're not
@@ -928,8 +920,7 @@ mod tests {
         // tier. Before any solidified head is set, tier is Seen and
         // solidified_head is None.
         let mut e = small_engine();
-        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0)))
-            .expect("accept");
+        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0))).expect("accept");
         match &outs[0] {
             Output::New(s) => {
                 assert_eq!(s.finality.tier, FinalityTier::Seen);
@@ -943,8 +934,7 @@ mod tests {
     fn finality_envelope_uses_chain_head_when_set() {
         let mut e = small_engine();
         let _ = e.set_solidified_head(105);
-        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0)))
-            .expect("accept");
+        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0))).expect("accept");
         // 100 ≤ 105 ⇒ Finalized. Wait — actually no: the engine emits
         // a NEW for 100, then maybe_emit_irreversible fires for 100
         // because 100 ≤ 105. The NEW carries Finalized tier? No —
@@ -982,8 +972,8 @@ mod tests {
             accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
-        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
-            .expect("accept reorg");
+        let outs =
+            accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa))).expect("accept reorg");
         let observed = outs
             .iter()
             .find_map(|o| match o {
@@ -996,7 +986,7 @@ mod tests {
             })
             .expect("ForkObserved should be emitted");
         assert_eq!(observed.0, 102);
-        assert_eq!(observed.1.0, id(102, 0xb));
+        assert_eq!(observed.1 .0, id(102, 0xb));
         assert_eq!(observed.2.len(), 1);
         assert_eq!(observed.2[0].0, id(102, 0xa));
     }
@@ -1011,8 +1001,7 @@ mod tests {
             accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
-        accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
-            .expect("reorg");
+        accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa))).expect("reorg");
         // No solidified head yet → no ForkResolved.
         // Solidified head jumps to 105 → ForkResolved fires.
         let outs = e.set_solidified_head(105);
@@ -1035,7 +1024,7 @@ mod tests {
             .expect("ForkResolved should fire");
         assert_eq!(resolved.0, 102);
         assert_eq!(resolved.1, 105);
-        assert_eq!(resolved.2.0, id(102, 0xb));
+        assert_eq!(resolved.2 .0, id(102, 0xb));
         assert_eq!(resolved.3[0].0, id(102, 0xa));
     }
 

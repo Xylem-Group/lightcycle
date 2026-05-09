@@ -77,6 +77,9 @@ mod tests {
         // Sanity: a high enough height that all 8 bytes matter.
         let c = Cursor::new(0x0123_4567_89AB_CDEF, BlockId([0; 32]));
         let bytes = c.to_bytes();
-        assert_eq!(&bytes[..8], &[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        assert_eq!(
+            &bytes[..8],
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+        );
     }
 }

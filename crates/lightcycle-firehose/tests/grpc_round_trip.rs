@@ -13,9 +13,11 @@ use std::time::Duration;
 use lightcycle_codec::{DecodedBlock, DecodedHeader};
 use lightcycle_firehose::{serve, BlockOracle, Hub, SharedBlockOracle, BLOCK_TYPE_URL};
 use lightcycle_proto::firehose::v2::{
-    endpoint_info_client::EndpointInfoClient, fetch_client::FetchClient,
+    endpoint_info_client::EndpointInfoClient,
+    fetch_client::FetchClient,
     single_block_request::{BlockNumber, Reference},
-    stream_client::StreamClient, ForkStep, InfoRequest, Request, SingleBlockRequest,
+    stream_client::StreamClient,
+    ForkStep, InfoRequest, Request, SingleBlockRequest,
 };
 use lightcycle_proto::sf::tron::type_v1 as tron_v1;
 use lightcycle_relayer::{BufferedBlock, Cursor, Output, StreamableBlock};

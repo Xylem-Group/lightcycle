@@ -394,7 +394,10 @@ mod tests {
         assert_eq!(decoded.logs[0].topics[0], [0xaa; 32]);
         assert_eq!(decoded.logs[0].data, vec![0x01, 0x02, 0x03]);
         assert_eq!(decoded.internal_transactions.len(), 1);
-        assert_eq!(decoded.internal_transactions[0].call_values[0].call_value, 42);
+        assert_eq!(
+            decoded.internal_transactions[0].call_values[0].call_value,
+            42
+        );
     }
 
     #[test]

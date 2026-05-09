@@ -39,8 +39,7 @@ use lightcycle_types::{Address, SrSet};
 /// that the recovery path is exercised end-to-end. See the test crate's
 /// docstring on why ECKey-class matters (~25% of SRs use SM2 instead;
 /// for those, recover_witness_address returns a non-matching address).
-const MAINNET_HEAD_FIXTURE: &[u8] =
-    include_bytes!("../tests/fixtures/mainnet-head.bin");
+const MAINNET_HEAD_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/mainnet-head.bin");
 
 fn bench_recover_only(c: &mut Criterion) {
     // Pre-decode once so the bench measures only the cryptographic
@@ -54,8 +53,8 @@ fn bench_recover_only(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.bench_function("recover_only", |b| {
         b.iter(|| {
-            let addr = recover_witness_address(black_box(&prehash), black_box(&sig))
-                .expect("recover");
+            let addr =
+                recover_witness_address(black_box(&prehash), black_box(&sig)).expect("recover");
             black_box(addr);
         });
     });

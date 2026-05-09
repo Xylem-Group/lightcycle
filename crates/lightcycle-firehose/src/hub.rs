@@ -54,16 +54,13 @@ impl Hub {
         tokio::spawn(async move {
             while let Some(output) = input.recv().await {
                 // Track active subscribers so we can update a gauge.
-                metrics::gauge!("lightcycle_firehose_subscribers")
-                    .set(tx.receiver_count() as f64);
+                metrics::gauge!("lightcycle_firehose_subscribers").set(tx.receiver_count() as f64);
 
                 // broadcast::send only errors when there are zero
                 // active receivers — that's "nobody listening yet,"
                 // not a fatal condition.
                 if tx.send(output).is_err() {
-                    debug!(
-                        "no firehose subscribers; output dropped (steady-state pre-connect)"
-                    );
+                    debug!("no firehose subscribers; output dropped (steady-state pre-connect)");
                     metrics::counter!(
                         "lightcycle_firehose_outputs_total",
                         "result" => "dropped_no_subscribers"

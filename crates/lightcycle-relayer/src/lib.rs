@@ -39,9 +39,7 @@ mod engine;
 mod service;
 
 pub use cursor::Cursor;
-pub use engine::{
-    BufferedBlock, Output, ReorgConfig, ReorgEngine, ReorgError, StreamableBlock,
-};
+pub use engine::{BufferedBlock, Output, ReorgConfig, ReorgEngine, ReorgError, StreamableBlock};
 pub use service::{
     describe_metrics, static_sr_set, BlockFetcher, FetchedBlock, GrpcBlockFetcher, RelayerService,
     ServiceError, VerifyPolicy,

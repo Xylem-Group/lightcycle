@@ -94,8 +94,8 @@ pub fn recover_witness_address(msg_hash: &[u8; 32], sig_bytes: &[u8]) -> Result<
         });
     }
 
-    let sig = Signature::from_slice(&sig_bytes[..64])
-        .map_err(|_| CodecError::SignatureRecoveryFailed)?;
+    let sig =
+        Signature::from_slice(&sig_bytes[..64]).map_err(|_| CodecError::SignatureRecoveryFailed)?;
 
     // v normalization. TRON's ECKey.signatureToKey accepts both raw
     // recovery ids (0, 1) and Ethereum-style v+27 (27, 28). Anything
@@ -140,9 +140,7 @@ mod tests {
     /// Sign a message hash with a fresh random key, returning
     /// `(sig_with_v, recovered_address)`. Used to drive the verify path
     /// end-to-end without a network.
-    fn sign_test(
-        msg_hash: &[u8; 32],
-    ) -> ([u8; WITNESS_SIG_LEN], Address) {
+    fn sign_test(msg_hash: &[u8; 32]) -> ([u8; WITNESS_SIG_LEN], Address) {
         // Fixed seed so test failures are reproducible. Derived key is
         // just a valid secp256k1 scalar; nothing about it has to match
         // any real-network witness.

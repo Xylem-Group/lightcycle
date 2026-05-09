@@ -33,18 +33,12 @@ pub enum CodecError {
     /// a different length. Surfaces protocol-shape violations rather
     /// than panicking on a slice copy.
     #[error("expected 32-byte field {field}, got {got} bytes")]
-    BadHash {
-        field: &'static str,
-        got: usize,
-    },
+    BadHash { field: &'static str, got: usize },
 
     /// TRON addresses are 21 bytes (1-byte network prefix + 20-byte
     /// hash). Wrong-length witness/sender/receiver address.
     #[error("expected 21-byte address ({field}), got {got} bytes")]
-    BadAddress {
-        field: &'static str,
-        got: usize,
-    },
+    BadAddress { field: &'static str, got: usize },
 
     /// `Transaction.contract` had a `r#type` value not in our vendored
     /// enum. Future TRON forks may add new contract types ahead of our
@@ -56,10 +50,7 @@ pub enum CodecError {
     /// Witness signature (or any 65-byte ECDSA blob) had wrong length.
     /// Surfaces shape violations before we hand bytes to k256.
     #[error("expected 65-byte field {field}, got {got} bytes")]
-    BadSignature {
-        field: &'static str,
-        got: usize,
-    },
+    BadSignature { field: &'static str, got: usize },
 
     /// k256 rejected the signature: malformed r/s, point-not-on-curve,
     /// or an invalid recovery id. Surfaces as a single variant because
@@ -87,10 +78,7 @@ pub enum CodecError {
         "witness {} is not in the active SR set ({set_size} members)",
         hex::encode(witness.0)
     )]
-    WitnessNotInSrSet {
-        witness: Address,
-        set_size: usize,
-    },
+    WitnessNotInSrSet { witness: Address, set_size: usize },
 }
 
 /// Crate-local convenience alias; all the codec entry points return this.

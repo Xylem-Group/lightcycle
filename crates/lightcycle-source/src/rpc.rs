@@ -128,10 +128,7 @@ impl HeadPoller {
 
     async fn poll_once(&self) -> Result<HeadInfo> {
         let start = Instant::now();
-        let url = format!(
-            "{}/wallet/getnowblock",
-            self.rpc_url.trim_end_matches('/')
-        );
+        let url = format!("{}/wallet/getnowblock", self.rpc_url.trim_end_matches('/'));
 
         // POST with empty JSON body — `getnowblock` accepts no parameters
         // but the server's HTTP handler is POST-only.
@@ -147,8 +144,7 @@ impl HeadPoller {
         let body = resp.bytes().await.context("read response body")?;
 
         let elapsed = start.elapsed();
-        metrics::histogram!("lightcycle_rpc_poll_duration_seconds")
-            .record(elapsed.as_secs_f64());
+        metrics::histogram!("lightcycle_rpc_poll_duration_seconds").record(elapsed.as_secs_f64());
 
         if !status.is_success() {
             anyhow::bail!(

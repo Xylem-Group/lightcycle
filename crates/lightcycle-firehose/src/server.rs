@@ -67,8 +67,7 @@ impl StreamService {
 
 #[tonic::async_trait]
 impl StreamSvc for StreamService {
-    type BlocksStream =
-        Pin<Box<dyn Stream<Item = Result<Response, Status>> + Send + 'static>>;
+    type BlocksStream = Pin<Box<dyn Stream<Item = Result<Response, Status>> + Send + 'static>>;
 
     async fn blocks(
         &self,
@@ -258,8 +257,7 @@ impl FetchSvc for FetchService {
             }
         };
 
-        metrics::counter!("lightcycle_firehose_fetch_total", "result" => "in_flight")
-            .increment(1);
+        metrics::counter!("lightcycle_firehose_fetch_total", "result" => "in_flight").increment(1);
         let started = std::time::Instant::now();
 
         let outcome = self.oracle.fetch_block_by_number(height).await;
@@ -285,8 +283,7 @@ impl FetchSvc for FetchService {
                     type_url: BLOCK_TYPE_URL.into(),
                     value: block_pb.encode_to_vec(),
                 };
-                metrics::counter!("lightcycle_firehose_fetch_total", "result" => "ok")
-                    .increment(1);
+                metrics::counter!("lightcycle_firehose_fetch_total", "result" => "ok").increment(1);
                 Ok(tonic::Response::new(SingleBlockResponse {
                     block: Some(block_any),
                     metadata: Some(metadata),
@@ -600,7 +597,11 @@ mod tests {
             },
         );
         let svc = FetchService::new(Arc::new(oracle));
-        let resp = svc.block(req_by_number(100)).await.expect("ok").into_inner();
+        let resp = svc
+            .block(req_by_number(100))
+            .await
+            .expect("ok")
+            .into_inner();
 
         let md = resp.metadata.expect("metadata populated");
         assert_eq!(md.num, 100);

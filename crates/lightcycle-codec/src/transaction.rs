@@ -466,7 +466,11 @@ mod tests {
         let c = build_contract(WireContractType::TransferContract as i32, m.encode_to_vec());
         let d = decode_contract(&c).expect("decode");
         match d {
-            DecodedContract::Transfer { owner, to, amount_sun } => {
+            DecodedContract::Transfer {
+                owner,
+                to,
+                amount_sun,
+            } => {
                 assert_eq!(owner, addr(0x11));
                 assert_eq!(to, addr(0x22));
                 assert_eq!(amount_sun, 1_000_000);
@@ -491,7 +495,11 @@ mod tests {
         );
         let d = decode_contract(&c).unwrap();
         match d {
-            DecodedContract::TriggerSmartContract { contract_address, data, .. } => {
+            DecodedContract::TriggerSmartContract {
+                contract_address,
+                data,
+                ..
+            } => {
                 assert_eq!(contract_address, addr(0x44));
                 assert_eq!(&data[..4], &[0xa9, 0x05, 0x9c, 0xbb]);
             }
@@ -513,7 +521,9 @@ mod tests {
         );
         let d = decode_contract(&c).unwrap();
         match d {
-            DecodedContract::TransferAsset { asset_name, amount, .. } => {
+            DecodedContract::TransferAsset {
+                asset_name, amount, ..
+            } => {
                 assert_eq!(asset_name, b"1000001");
                 assert_eq!(amount, 42);
             }

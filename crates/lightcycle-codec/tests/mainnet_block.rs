@@ -151,7 +151,8 @@ fn mainnet_block_signature_recovers_to_header_witness() {
     )
     .expect("recover");
     assert_eq!(
-        recovered, decoded.header.witness,
+        recovered,
+        decoded.header.witness,
         "recovered address {} doesn't match header witness {}",
         hex::encode(recovered.0),
         hex::encode(decoded.header.witness.0),

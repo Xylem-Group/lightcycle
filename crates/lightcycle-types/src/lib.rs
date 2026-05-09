@@ -249,7 +249,10 @@ mod tests {
         let s = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
         let addr = Address::from_base58check(s).expect("decode");
         assert_eq!(addr.to_base58check(), s);
-        assert_eq!(addr.0[0], 0x41, "USDT mainnet address should have 0x41 prefix");
+        assert_eq!(
+            addr.0[0], 0x41,
+            "USDT mainnet address should have 0x41 prefix"
+        );
     }
 
     #[test]
@@ -306,10 +309,7 @@ mod tests {
             FinalityTier::derive(100, None, true),
             FinalityTier::Confirmed,
         );
-        assert_eq!(
-            FinalityTier::derive(100, None, false),
-            FinalityTier::Seen,
-        );
+        assert_eq!(FinalityTier::derive(100, None, false), FinalityTier::Seen,);
     }
 
     #[test]

@@ -243,7 +243,10 @@ impl<F: BlockFetcher> std::fmt::Debug for RelayerService<F> {
             .field("verify_policy", &self.verify_policy)
             .field("poll_interval", &self.poll_interval)
             .field("engine_len", &self.engine.len())
-            .field("sr_set_size", &self.sr_set.borrow().as_ref().map(|s| s.len()))
+            .field(
+                "sr_set_size",
+                &self.sr_set.borrow().as_ref().map(|s| s.len()),
+            )
             .finish()
     }
 }
@@ -407,8 +410,9 @@ impl<F: BlockFetcher> RelayerService<F> {
                         metrics::counter!("lightcycle_relay_verify_total", "result" => "ok")
                             .increment(1);
                     }
-                    Err(e) if matches!(e, CodecError::WitnessAddressMismatch { .. })
-                        && self.verify_policy == VerifyPolicy::Lenient =>
+                    Err(e)
+                        if matches!(e, CodecError::WitnessAddressMismatch { .. })
+                            && self.verify_policy == VerifyPolicy::Lenient =>
                     {
                         // Expected SM2-class block. Accept under
                         // lenient policy; log + count.

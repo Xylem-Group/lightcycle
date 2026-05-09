@@ -49,11 +49,8 @@ pub fn encode_block(buffered: &BufferedBlock, finality: BlockFinality) -> pb::Bl
     // its `info` in O(1). HashMap rather than sort-and-binary-search:
     // mainnet block density (10–500 txs) makes the constant factor
     // win out and the code stays simpler.
-    let info_by_hash: HashMap<TxHash, &DecodedTxInfo> = buffered
-        .tx_infos
-        .iter()
-        .map(|i| (i.tx_hash, i))
-        .collect();
+    let info_by_hash: HashMap<TxHash, &DecodedTxInfo> =
+        buffered.tx_infos.iter().map(|i| (i.tx_hash, i)).collect();
 
     pb::Block {
         number: buffered.height,
@@ -93,10 +90,7 @@ fn encode_finality_tier(t: FinalityTier) -> pb::FinalityTier {
     }
 }
 
-fn encode_transaction(
-    tx: &DecodedTransaction,
-    info: Option<&DecodedTxInfo>,
-) -> pb::Transaction {
+fn encode_transaction(tx: &DecodedTransaction, info: Option<&DecodedTxInfo>) -> pb::Transaction {
     pb::Transaction {
         id: tx.hash.0.to_vec(),
         timestamp_ms: tx.timestamp_ms,
@@ -162,7 +156,11 @@ fn encode_contract(c: &DecodedContract) -> pb::Contract {
     use pb::ContractKind as PbKind;
 
     match c {
-        DecodedContract::Transfer { owner, to, amount_sun } => pb::Contract {
+        DecodedContract::Transfer {
+            owner,
+            to,
+            amount_sun,
+        } => pb::Contract {
             kind: PbKind::Transfer as i32,
             unknown_kind: 0,
             payload: Some(Payload::Transfer(pb::Transfer {
@@ -219,9 +217,7 @@ fn encode_contract(c: &DecodedContract) -> pb::Contract {
             unknown_kind: 0,
             payload: Some(Payload::CreateSmartContract(pb::CreateSmartContract {
                 owner: owner.0.to_vec(),
-                contract_address: contract_address
-                    .map(|a| a.0.to_vec())
-                    .unwrap_or_default(),
+                contract_address: contract_address.map(|a| a.0.to_vec()).unwrap_or_default(),
                 name: name.clone(),
                 bytecode: bytecode.clone(),
                 consume_user_resource_percent: *consume_user_resource_percent,
@@ -477,7 +473,10 @@ mod tests {
         assert_eq!(pb_info.logs[0].data, vec![0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(pb_info.internal_transactions.len(), 1);
         assert_eq!(pb_info.internal_transactions[0].rejected, false);
-        assert_eq!(pb_info.internal_transactions[0].call_values[0].call_value, 100);
+        assert_eq!(
+            pb_info.internal_transactions[0].call_values[0].call_value,
+            100
+        );
     }
 
     #[test]

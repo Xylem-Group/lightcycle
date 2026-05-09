@@ -48,8 +48,7 @@ fn collect_protos(root: &Path, skip_dirs: &[&str]) -> std::io::Result<Vec<PathBu
                 if !skip {
                     stack.push(path);
                 }
-            } else if path.extension().is_some_and(|e| e == "proto")
-                && entry.metadata()?.len() > 0
+            } else if path.extension().is_some_and(|e| e == "proto") && entry.metadata()?.len() > 0
             {
                 out.push(path);
             }
@@ -66,9 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sf_dir = proto_root.join("sf");
 
     if !tron_dir.exists() || !firehose_dir.exists() {
-        println!(
-            "cargo:warning=proto/{{tron,firehose}}/ missing — run scripts/sync-protos.sh"
-        );
+        println!("cargo:warning=proto/{{tron,firehose}}/ missing — run scripts/sync-protos.sh");
         return Ok(());
     }
 

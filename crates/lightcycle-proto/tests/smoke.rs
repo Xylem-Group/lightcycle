@@ -21,9 +21,8 @@ fn tron_transfer_contract_default_roundtrip() {
     // `protocol` package as the monolithic schema.
     let tx = lightcycle_proto::tron::protocol::TransferContract::default();
     let encoded = tx.encode_to_vec();
-    let decoded =
-        lightcycle_proto::tron::protocol::TransferContract::decode(&encoded[..])
-            .expect("decode default TransferContract");
+    let decoded = lightcycle_proto::tron::protocol::TransferContract::decode(&encoded[..])
+        .expect("decode default TransferContract");
     assert_eq!(tx, decoded);
 }
 
