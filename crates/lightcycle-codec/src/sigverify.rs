@@ -3,9 +3,9 @@
 //!
 //! TRON signs each block with the producer SR's secp256k1 private key.
 //! The signature lives at `BlockHeader.witness_signature` and covers
-//! `sha256(BlockHeader.raw_data)` — which is exactly the `block_id` we
-//! already compute during decode. So sigverify reuses that hash; no
-//! re-hashing of the raw header.
+//! `sha256(BlockHeader.raw_data)` — which is the `raw_data_hash` field
+//! `decode_header` records alongside the height-prefixed `block_id`.
+//! Sigverify reuses that hash; no re-hashing of the raw header.
 //!
 //! The signature blob is 65 bytes laid out as `r:32 || s:32 || v:1`,
 //! where `v` is the recovery id. TRON accepts any of `{0, 1, 27, 28}`
@@ -59,7 +59,7 @@ const WITNESS_SIG_LEN: usize = 65;
 /// unauthorized signer" (rogue witness, stale SR set on either side).
 /// Both are required.
 pub fn verify_witness_signature(header: &DecodedHeader, sr_set: &SrSet) -> Result<()> {
-    let recovered = recover_witness_address(&header.block_id.0, &header.witness_signature)?;
+    let recovered = recover_witness_address(&header.raw_data_hash, &header.witness_signature)?;
 
     if recovered != header.witness {
         return Err(CodecError::WitnessAddressMismatch {
@@ -166,6 +166,7 @@ mod tests {
             height: 82_524_196,
             block_id: BlockId([0xaa; 32]),
             parent_id: BlockId([0xbb; 32]),
+            raw_data_hash: [0xaa; 32],
             tx_trie_root: [0xcc; 32],
             timestamp_ms: 1_777_854_558_000,
             witness,
@@ -219,7 +220,7 @@ mod tests {
         let msg = [0xee; 32];
         let (sig, addr) = sign_test(&msg);
         let mut header = dummy_header(addr, sig.to_vec());
-        header.block_id = BlockId(msg);
+        header.raw_data_hash = msg;
 
         let sr_set = SrSet::new([addr]);
         verify_witness_signature(&header, &sr_set).expect("verify");
@@ -234,7 +235,7 @@ mod tests {
         // signed. Recovery succeeds but the address doesn't match.
         let bogus_witness = Address([0x41; 21]);
         let mut header = dummy_header(bogus_witness, sig.to_vec());
-        header.block_id = BlockId(msg);
+        header.raw_data_hash = msg;
 
         let sr_set = SrSet::new([real_signer, bogus_witness]);
         let err = verify_witness_signature(&header, &sr_set).unwrap_err();
@@ -255,7 +256,7 @@ mod tests {
         let msg = [0xee; 32];
         let (sig, signer) = sign_test(&msg);
         let mut header = dummy_header(signer, sig.to_vec());
-        header.block_id = BlockId(msg);
+        header.raw_data_hash = msg;
 
         // Empty SR set: signature is internally consistent but signer
         // isn't authorized.

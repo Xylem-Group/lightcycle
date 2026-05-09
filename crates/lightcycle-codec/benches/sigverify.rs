@@ -47,7 +47,7 @@ fn bench_recover_only(c: &mut Criterion) {
     // recovery, not the protobuf parse. Both prehash and signature are
     // owned by the bench closure; nothing allocates on the hot path.
     let decoded = decode_block(MAINNET_HEAD_FIXTURE).expect("decode");
-    let prehash = decoded.header.block_id.0; // sha256(raw_data)
+    let prehash = decoded.header.raw_data_hash; // sha256(raw_data); block_id is height-prefixed
     let sig = decoded.header.witness_signature.clone();
 
     let mut group = c.benchmark_group("sigverify");
@@ -69,7 +69,7 @@ fn bench_decode_then_recover(c: &mut Criterion) {
         b.iter(|| {
             let decoded = decode_block(black_box(MAINNET_HEAD_FIXTURE)).expect("decode");
             let addr = recover_witness_address(
-                black_box(&decoded.header.block_id.0),
+                black_box(&decoded.header.raw_data_hash),
                 black_box(&decoded.header.witness_signature),
             )
             .expect("recover");

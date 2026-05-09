@@ -33,11 +33,19 @@ pub struct DecodedHeader {
     /// `BlockHeader.raw_data.number`. Cast from i64; TRON's height is
     /// always non-negative in practice.
     pub height: BlockHeight,
-    /// Sha256 of the encoded `raw_data`. Stable identifier; matches
-    /// java-tron's `blockID` concatenation of (height-prefixed) hash.
+    /// java-tron's canonical `blockID`: 8-byte BE height || trailing
+    /// 24 bytes of `sha256(raw_data)`. This is the form used in wire
+    /// `parent_hash`, so the relayer's chaining check is
+    /// `parent_id_of_N+1 == block_id_of_N` byte-for-byte.
     pub block_id: BlockId,
-    /// Parent block's id.
+    /// Parent block's id (also height-prefixed; first 8 bytes encode
+    /// height N-1).
     pub parent_id: BlockId,
+    /// `sha256(raw_data)` — the unprefixed digest. This is what the
+    /// SR signs, so [`crate::verify_witness_signature`] uses it as
+    /// the recovery prehash. Distinct from [`block_id`] because the
+    /// block id is height-prefixed and would not recover correctly.
+    pub raw_data_hash: [u8; 32],
     /// `raw_data.tx_trie_root` — Merkle root of the transactions list.
     pub tx_trie_root: [u8; 32],
     /// Block timestamp (ms since epoch).
@@ -86,23 +94,30 @@ pub fn decode_block_message(block: &protocol::Block) -> Result<DecodedBlock> {
 fn decode_header(h: &protocol::BlockHeader) -> Result<DecodedHeader> {
     let raw = h.raw_data.as_ref().ok_or(CodecError::MissingHeaderRaw)?;
 
-    // Block ID = sha256(raw_data). Re-encoding here matches what
-    // java-tron does internally for the block-id derivation; the
-    // canonical 32-byte hash is what peers use to dedupe.
+    // Two 32-byte derived values:
+    //   * raw_data_hash = sha256(raw_data) — unprefixed; the SR signs this.
+    //   * block_id      = height (BE i64) || raw_data_hash[8..] — the
+    //     canonical id wire `parent_hash` carries.
+    // Both come from the same sha256, so we compute it once.
     let raw_bytes = raw.encode_to_vec();
-    let block_id_bytes = Sha256::digest(&raw_bytes);
+    let digest = Sha256::digest(&raw_bytes);
+
+    let mut raw_data_hash = [0u8; 32];
+    raw_data_hash.copy_from_slice(&digest);
+
+    let mut block_id_arr = [0u8; 32];
+    block_id_arr[..8].copy_from_slice(&raw.number.to_be_bytes());
+    block_id_arr[8..].copy_from_slice(&digest[8..]);
 
     let parent_id = bytes_to_block_id(&raw.parent_hash, "parent_hash")?;
     let tx_trie_root = bytes_to_hash32(&raw.tx_trie_root, "tx_trie_root")?;
     let witness = bytes_to_address(&raw.witness_address, "witness_address")?;
 
-    let mut block_id_arr = [0u8; 32];
-    block_id_arr.copy_from_slice(&block_id_bytes);
-
     Ok(DecodedHeader {
         height: u64::try_from(raw.number).unwrap_or(0),
         block_id: BlockId(block_id_arr),
         parent_id,
+        raw_data_hash,
         tx_trie_root,
         timestamp_ms: raw.timestamp,
         witness,

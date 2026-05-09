@@ -102,6 +102,39 @@ fn mainnet_block_id_is_deterministic() {
     assert_eq!(a.transactions.len(), b.transactions.len());
 }
 
+/// java-tron's `blockID` is height-prefixed: the first 8 bytes are
+/// the height as big-endian i64, the remaining 24 bytes are the
+/// trailing 24 bytes of `sha256(raw_data)`. Wire `parent_hash` uses
+/// that height-prefixed form, so the relayer can only chain blocks
+/// (`block_id` of N == `parent_id` of N+1) if our `block_id` matches
+/// the convention. This test pins the convention against the live
+/// fixture's parent_id, since parent_id is whatever the upstream
+/// node serialized — the source of truth.
+#[test]
+fn mainnet_block_id_matches_height_prefixed_convention() {
+    let decoded = decode_block(MAINNET_HEAD_FIXTURE).unwrap();
+    let height_be = (decoded.header.height as i64).to_be_bytes();
+    assert_eq!(
+        &decoded.header.block_id.0[..8],
+        &height_be,
+        "block_id first 8 bytes ({}) don't match height ({}) BE-encoded ({}) — \
+         block_id is using bare sha256 instead of TRON's height-prefixed form. \
+         Will break chaining: block_id_of_N != parent_id_of_N+1.",
+        hex::encode(&decoded.header.block_id.0[..8]),
+        decoded.header.height,
+        hex::encode(height_be),
+    );
+    // parent_id is from the wire — check it also follows the convention
+    // (its first 8 bytes encode height N-1).
+    let parent_height_be = ((decoded.header.height - 1) as i64).to_be_bytes();
+    assert_eq!(
+        &decoded.header.parent_id.0[..8],
+        &parent_height_be,
+        "parent_id first 8 bytes don't encode height N-1 — \
+         either upstream changed the convention or fixture is wrong",
+    );
+}
+
 /// The strongest test in this file: a real mainnet block was signed by
 /// the witness whose address is in its own header. ECDSA recovery is
 /// deterministic, so if our recovery + address-derivation pipeline is
@@ -113,7 +146,7 @@ fn mainnet_block_id_is_deterministic() {
 fn mainnet_block_signature_recovers_to_header_witness() {
     let decoded = decode_block(MAINNET_HEAD_FIXTURE).expect("decode");
     let recovered = recover_witness_address(
-        &decoded.header.block_id.0,
+        &decoded.header.raw_data_hash,
         &decoded.header.witness_signature,
     )
     .expect("recover");
