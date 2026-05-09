@@ -133,6 +133,30 @@ struct RelayArgs {
     /// `Irreversible`. TRON's solidified rule is 19/27 SR confirmations.
     #[arg(long, env = "LIGHTCYCLE_RELAY_FINALITY_DEPTH", default_value_t = 19)]
     finality_depth: usize,
+
+    /// Bind the Firehose v2 gRPC server here. When set, every
+    /// emitted Output is broadcast to attached `Stream.Blocks`
+    /// subscribers. When unset, the relay runs in log-only mode
+    /// (engine still drives, just no consumers).
+    #[arg(long, env = "LIGHTCYCLE_RELAY_FIREHOSE_LISTEN")]
+    firehose_listen: Option<SocketAddr>,
+
+    /// Chain identity reported by `EndpointInfo.Info`. Defaults to
+    /// "tron-mainnet" since that's what the LIGHTCYCLE_GRPC_URL
+    /// default targets; override for testnets.
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_RELAY_CHAIN_NAME",
+        default_value = "tron-mainnet"
+    )]
+    firehose_chain_name: String,
+
+    /// Hub broadcast capacity. Sets the per-subscriber lag tolerance
+    /// — a subscriber more than this many blocks behind gets an
+    /// `RESOURCE_EXHAUSTED` status and must reconnect. 1024 covers
+    /// roughly an hour of TRON blocks at 3s spacing.
+    #[arg(long, env = "LIGHTCYCLE_RELAY_HUB_CAPACITY", default_value_t = 1024)]
+    firehose_hub_capacity: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -333,39 +357,67 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         std::time::Duration::from_millis(args.poll_interval_ms.max(50)),
     );
 
-    // The service is the producer; we drain the receiver and currently
-    // just log. Once the firehose gRPC server lands, this is where its
-    // multiplex hub will subscribe.
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(256);
+    // mpsc from service to either the hub (firehose enabled) or a
+    // direct drain (firehose disabled). 256 is a comfortable buffer
+    // for the engine's burst pattern.
+    let (output_tx, output_rx) = tokio::sync::mpsc::channel(256);
     let service_handle = tokio::spawn(service.run(output_tx));
+
+    // Wire the firehose gRPC server when the operator asked for it.
+    // The hub pump task drains output_rx → broadcast; the gRPC server
+    // serves Stream.Blocks subscribers from the broadcast.
+    let firehose_handles = if let Some(listen) = args.firehose_listen {
+        lightcycle_firehose::describe_metrics();
+        let hub = lightcycle_firehose::Hub::new(args.firehose_hub_capacity);
+        let pump_handle = hub.pump_from(output_rx);
+
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let chain_name = args.firehose_chain_name.clone();
+        let hub_for_serve = hub.clone();
+        let server_handle = tokio::spawn(async move {
+            if let Err(e) = lightcycle_firehose::serve(
+                listen,
+                hub_for_serve,
+                chain_name,
+                async move {
+                    let _ = server_shutdown_rx.await;
+                },
+            )
+            .await
+            {
+                tracing::error!(error = %e, "firehose server exited with error");
+            }
+        });
+        Some((server_handle, pump_handle, server_shutdown_tx))
+    } else {
+        // Log-only mode: drain the mpsc into the void so the service
+        // doesn't back-pressure. The service already logs each block;
+        // we don't double-log here.
+        let drain_handle = tokio::spawn(async move {
+            let mut rx = output_rx;
+            while rx.recv().await.is_some() {}
+        });
+        // Encode None signal as the same shape so the shutdown branch
+        // below treats both modes uniformly.
+        Some((drain_handle, tokio::spawn(async {}), {
+            let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+            tx
+        }))
+    };
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let _ = (&mut shutdown).await;
+    tracing::info!("ctrl-c received, shutting down relay");
 
-    // Drain emitted Outputs alongside the shutdown signal. The service
-    // already logs each block; we don't double-log here. The drain
-    // exists to (a) keep the channel non-full so the service doesn't
-    // back-pressure on send, and (b) act as the obvious wiring point
-    // for the firehose subscription manager.
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => {
-                tracing::info!("ctrl-c received, shutting down relay");
-                break;
-            }
-            recv = output_rx.recv() => {
-                match recv {
-                    Some(_output) => {} // logged inside the service
-                    None => {
-                        tracing::warn!("relay service exited");
-                        break;
-                    }
-                }
-            }
-        }
+    if let Some((server_handle, pump_handle, server_shutdown_tx)) = firehose_handles {
+        // server_shutdown_tx is a fresh oneshot in log-only mode (no
+        // server to shut down), so signaling it is harmless. In
+        // firehose mode it triggers tonic's serve_with_shutdown.
+        let _ = server_shutdown_tx.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_handle).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pump_handle).await;
     }
-    drop(output_rx);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), service_handle).await;
     Ok(())
 }

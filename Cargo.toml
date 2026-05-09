@@ -36,7 +36,7 @@ nursery = "warn"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 async-trait = "0.1"
 

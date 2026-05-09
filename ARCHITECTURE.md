@@ -80,7 +80,11 @@ The orchestrator. Owns the canonical head pointer and the live block buffer.
 
 ### lightcycle-firehose
 
-gRPC server speaking the [`bstream.v2`](https://github.com/streamingfast/bstream) protocol used by Substreams. Multiplexes one upstream block stream to many downstream consumers, each holding its own cursor and backpressure state. Supports both live and backfill subscriptions in a single API.
+gRPC server speaking the [`sf.firehose.v2`](https://github.com/streamingfast/proto) protocol used by Substreams. Multiplexes one upstream block stream to many downstream consumers via a `tokio::sync::broadcast` hub — slow subscribers get `RESOURCE_EXHAUSTED` rather than back-pressuring the engine, which is correct semantics for a relayer.
+
+v0.1 ships **live mode only**: `Stream.Blocks` rejects requests carrying `cursor`, `start_block_num`, `stop_block_num`, `final_blocks_only`, or `transforms` with `FailedPrecondition`. Backfill / replay and the `Fetch.Block` service land when [`lightcycle-store`] is wired into the pipeline (cursor → buffered/persisted block lookup). `EndpointInfo.Info` is implemented and reports chain identity for orchestrator sanity-check.
+
+`Response.metadata` is fully populated (num, id, parent_num, parent_id, lib_num=0 for now, time). `Response.block` carries a placeholder `Any` (zero bytes) until the chain-specific `sf.tron.type.v1.Block` proto lands — Substreams modules will need that payload to do anything useful, but consumers that only need the cursor + metadata stream work today.
 
 ### lightcycle-store
 

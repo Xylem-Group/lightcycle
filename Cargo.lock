@@ -1401,10 +1401,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "hex",
+ "lightcycle-codec",
  "lightcycle-proto",
+ "lightcycle-relayer",
  "lightcycle-types",
  "metrics",
  "prost",
+ "prost-types",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -2720,6 +2724,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
