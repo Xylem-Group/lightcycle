@@ -19,24 +19,44 @@
 //!   `sha256(raw_data)` digest already computed during decode (it's
 //!   the `block_id`).
 //!
+//! - [`decode_transaction_info`] / [`decode_transaction_info_list`] —
+//!   parse the side-channel `TransactionInfo` (logs, internal txs,
+//!   resource accounting) the source layer fetches via
+//!   `getTransactionInfoByBlockNum`. The block proto doesn't carry
+//!   logs or sub-call traces; this is how consumers see them.
+//!
+//! - [`decode_trc20_transfer`] / [`decode_trc20_approval`] — the two
+//!   universal TRC-20 events recognized by topic hash. Standalone,
+//!   ABI-registry-free helpers; full-ABI decoding is future work.
+//!
 //! Deferred (separate entry points, separate crates' job to provide
 //! inputs):
 //!
-//! - **Event log decoding (TRC-20/721).** Needs an ABI registry. Lives
-//!   behind a future `decode_event(topics, data, abi)`.
-//! - **Internal transaction extraction.** Surfaces only via
-//!   `getTransactionInfoById` over RPC, not the block proto, so it's
-//!   the source layer's responsibility to fetch + the codec's to
-//!   parse the response.
-//! - **Resource accounting.** Composes from execution receipts, again
-//!   via `getTransactionInfoById`.
+//! - **Event log decoding (arbitrary contracts).** Needs an ABI
+//!   registry. Lives behind a future `decode_event(log, abi)` entry
+//!   point. v0.1 ships only the universal TRC-20 helpers above plus
+//!   raw [`Log`] passthrough.
+//! - **SM2 sigverify.** ~25% of TRON SRs sign with SM2 instead of
+//!   secp256k1; pulls in a separate crypto stack. Tracked as a
+//!   follow-up; v0.1 returns `WitnessAddressMismatch` on those blocks
+//!   and the relayer falls back to "trust the peer" for that header.
 
 mod block;
 mod error;
+mod events;
 mod sigverify;
 mod transaction;
+mod tx_info;
 
 pub use block::{decode_block, decode_block_message, DecodedBlock, DecodedHeader};
 pub use error::{CodecError, Result};
+pub use events::{
+    decode_trc20_approval, decode_trc20_transfer, Trc20Approval, Trc20Transfer,
+    TRC20_APPROVAL_TOPIC0, TRC20_TRANSFER_TOPIC0,
+};
 pub use sigverify::{recover_witness_address, verify_witness_signature};
 pub use transaction::{ContractKind, DecodedTransaction};
+pub use tx_info::{
+    decode_transaction_info, decode_transaction_info_list, decode_transaction_info_message,
+    CallValueInfo, DecodedTxInfo, InternalTx, Log, ResourceCost,
+};
