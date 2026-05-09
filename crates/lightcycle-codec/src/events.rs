@@ -11,10 +11,9 @@
 //!
 //! TRC-721 note: `Transfer(address indexed from, address indexed to,
 //! uint256 indexed tokenId)` shares topic[0] with TRC-20 Transfer
-//! but has 4 topics (tokenId is indexed). [`decode_trc20_transfer`]
-//! returns `None` on 4-topic logs, so 721 transfers fall through.
-//! A separate `decode_trc721_transfer` will land alongside the rest
-//! of TRC-721 support.
+//! but has 4 topics (tokenId is indexed). [`decode_trc721_transfer`]
+//! handles that shape; [`decode_trc20_transfer`] declines 4-topic
+//! logs so the two are mutually exclusive.
 
 use lightcycle_types::Address;
 
@@ -62,6 +61,18 @@ pub struct Trc20Approval {
     pub value: [u8; 32],
 }
 
+/// Decoded TRC-721 `Transfer` event. Same signature string as TRC-20,
+/// but the `tokenId` is indexed — distinguishable by topic count (4
+/// vs 3) at the wire level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trc721Transfer {
+    pub token: Address,
+    pub from: Address,
+    pub to: Address,
+    /// `tokenId` as raw 32-byte big-endian uint256.
+    pub token_id: [u8; 32],
+}
+
 /// Try to decode a [`Log`] as a TRC-20 `Transfer`. Returns `None` if
 /// the topic hash doesn't match, the topic count is wrong (TRC-721
 /// transfers have 4 topics), or the data length is wrong.
@@ -98,6 +109,27 @@ pub fn decode_trc20_approval(log: &Log) -> Option<Trc20Approval> {
         owner,
         spender,
         value,
+    })
+}
+
+/// Try to decode a [`Log`] as a TRC-721 `Transfer`. The signature
+/// string is identical to TRC-20 Transfer; the wire-level tell is
+/// the topic count (4 vs 3, because tokenId is indexed). `data` is
+/// expected to be empty — TRC-721 puts everything in topics.
+pub fn decode_trc721_transfer(log: &Log) -> Option<Trc721Transfer> {
+    if log.topics.len() != 4 || log.topics[0] != TRC20_TRANSFER_TOPIC0 {
+        return None;
+    }
+    let from = topic_to_tron_address(&log.topics[1])?;
+    let to = topic_to_tron_address(&log.topics[2])?;
+    // tokenId is the third indexed param — it's already a 32-byte
+    // word, no decoding needed beyond a copy.
+    let token_id = log.topics[3];
+    Some(Trc721Transfer {
+        token: log.address,
+        from,
+        to,
+        token_id,
     })
 }
 
@@ -222,6 +254,27 @@ mod tests {
         let a = decode_trc20_approval(&log).expect("decode");
         assert_eq!(&a.owner.0[1..], &[0x11; 20]);
         assert_eq!(&a.spender.0[1..], &[0x22; 20]);
+    }
+
+    #[test]
+    fn decodes_trc721_transfer_when_token_id_is_indexed() {
+        let mut log = synth_transfer_log();
+        // Add a fourth topic encoding tokenId = 7777.
+        let mut token_id = [0u8; 32];
+        token_id[24..].copy_from_slice(&7777u64.to_be_bytes());
+        log.topics.push(token_id);
+        log.data.clear(); // TRC-721 puts everything in topics
+        let t = decode_trc721_transfer(&log).expect("decode");
+        assert_eq!(t.token_id, token_id);
+        assert_eq!(&t.from.0[1..], &[0x11; 20]);
+        // TRC-20 decoder must decline this same log (4 topics).
+        assert!(decode_trc20_transfer(&log).is_none());
+    }
+
+    #[test]
+    fn trc721_decoder_declines_3_topic_log() {
+        let log = synth_transfer_log(); // 3 topics, valid TRC-20
+        assert!(decode_trc721_transfer(&log).is_none());
     }
 
     #[test]

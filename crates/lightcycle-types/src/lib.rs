@@ -22,6 +22,35 @@ pub struct TxHash(pub [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Address(pub [u8; 21]);
 
+impl Address {
+    /// Encode as base58check, the form TRON addresses take in every
+    /// human-facing UI ("T..." string, 34 chars on mainnet). Uses the
+    /// Bitcoin-style 4-byte double-sha256 checksum that TRON inherits.
+    pub fn to_base58check(&self) -> String {
+        bs58::encode(self.0).with_check().into_string()
+    }
+
+    /// Parse a base58check string back into an Address. Validates the
+    /// checksum and verifies the decoded length is exactly 21 bytes.
+    /// Does NOT enforce the `0x41` mainnet prefix — testnet uses
+    /// `0xa0`, and consumers may want to check explicitly.
+    pub fn from_base58check(s: &str) -> Result<Self> {
+        let bytes = bs58::decode(s)
+            .with_check(None)
+            .into_vec()
+            .map_err(|e| Error::InvalidAddress(format!("base58check: {e}")))?;
+        if bytes.len() != 21 {
+            return Err(Error::InvalidAddress(format!(
+                "expected 21 bytes after base58check decode, got {}",
+                bytes.len()
+            )));
+        }
+        let mut a = [0u8; 21];
+        a.copy_from_slice(&bytes);
+        Ok(Self(a))
+    }
+}
+
 /// Streaming step semantics, matching Firehose's `ForkStep`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Step {
@@ -93,3 +122,38 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base58check_round_trip_through_known_address() {
+        // Sun network's USDT contract address — pinned widely-known
+        // mainnet address used as a regression check on the TRX→T...
+        // mapping.
+        let s = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+        let addr = Address::from_base58check(s).expect("decode");
+        assert_eq!(addr.to_base58check(), s);
+        assert_eq!(addr.0[0], 0x41, "USDT mainnet address should have 0x41 prefix");
+    }
+
+    #[test]
+    fn base58check_rejects_bad_checksum() {
+        // Flip the last char to break the checksum.
+        let bad = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6T";
+        let err = Address::from_base58check(bad).unwrap_err();
+        assert!(matches!(err, Error::InvalidAddress(_)));
+    }
+
+    #[test]
+    fn base58check_rejects_non_21_byte_payload() {
+        // Construct a base58check of a 20-byte payload (Ethereum-style)
+        // and confirm we reject it. Skipping the wrapper here — easier
+        // to use bs58 directly to assemble.
+        let twenty = [0xab; 20];
+        let s = bs58::encode(twenty).with_check().into_string();
+        let err = Address::from_base58check(&s).unwrap_err();
+        assert!(matches!(err, Error::InvalidAddress(_)));
+    }
+}

@@ -51,8 +51,8 @@ mod tx_info;
 pub use block::{decode_block, decode_block_message, DecodedBlock, DecodedHeader};
 pub use error::{CodecError, Result};
 pub use events::{
-    decode_trc20_approval, decode_trc20_transfer, Trc20Approval, Trc20Transfer,
-    TRC20_APPROVAL_TOPIC0, TRC20_TRANSFER_TOPIC0,
+    decode_trc20_approval, decode_trc20_transfer, decode_trc721_transfer, Trc20Approval,
+    Trc20Transfer, Trc721Transfer, TRC20_APPROVAL_TOPIC0, TRC20_TRANSFER_TOPIC0,
 };
 pub use sigverify::{recover_witness_address, verify_witness_signature};
 pub use transaction::{ContractKind, DecodedContract, DecodedTransaction};
