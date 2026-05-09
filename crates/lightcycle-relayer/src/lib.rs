@@ -43,5 +43,6 @@ pub use engine::{
     BufferedBlock, Output, ReorgConfig, ReorgEngine, ReorgError, StreamableBlock,
 };
 pub use service::{
-    describe_metrics, BlockFetcher, GrpcBlockFetcher, RelayerService, ServiceError, VerifyPolicy,
+    describe_metrics, static_sr_set, BlockFetcher, GrpcBlockFetcher, RelayerService, ServiceError,
+    VerifyPolicy,
 };

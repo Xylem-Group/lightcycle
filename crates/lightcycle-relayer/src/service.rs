@@ -57,7 +57,7 @@ use lightcycle_codec::{decode_block_message, verify_witness_signature, CodecErro
 use lightcycle_source::GrpcSource;
 use lightcycle_types::SrSet;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
@@ -120,10 +120,16 @@ pub enum ServiceError {
 }
 
 /// Live ingest pipeline.
+///
+/// SR set lives behind a [`watch::Receiver`] so the CLI can refresh
+/// it across TRON's maintenance-period transitions (every 7,200
+/// blocks ≈ 6 hours) without restarting the service. See
+/// [`static_sr_set`] for tests / log-only mode where no refresh task
+/// exists.
 pub struct RelayerService<F: BlockFetcher> {
     fetcher: F,
     engine: ReorgEngine,
-    sr_set: Option<SrSet>,
+    sr_set: watch::Receiver<Option<SrSet>>,
     verify_policy: VerifyPolicy,
     poll_interval: Duration,
 }
@@ -134,16 +140,26 @@ impl<F: BlockFetcher> std::fmt::Debug for RelayerService<F> {
             .field("verify_policy", &self.verify_policy)
             .field("poll_interval", &self.poll_interval)
             .field("engine_len", &self.engine.len())
-            .field("sr_set_size", &self.sr_set.as_ref().map(|s| s.len()))
+            .field("sr_set_size", &self.sr_set.borrow().as_ref().map(|s| s.len()))
             .finish()
     }
+}
+
+/// Build a static, non-refreshable SR-set channel for callers that
+/// don't run a refresh task (tests, log-only mode). The `Sender` is
+/// dropped immediately; `borrow()` on the receiver continues to
+/// return the initial value forever.
+pub fn static_sr_set(set: Option<SrSet>) -> watch::Receiver<Option<SrSet>> {
+    let (tx, rx) = watch::channel(set);
+    drop(tx);
+    rx
 }
 
 impl<F: BlockFetcher> RelayerService<F> {
     pub fn new(
         fetcher: F,
         engine: ReorgEngine,
-        sr_set: Option<SrSet>,
+        sr_set: watch::Receiver<Option<SrSet>>,
         verify_policy: VerifyPolicy,
         poll_interval: Duration,
     ) -> Self {
@@ -154,12 +170,6 @@ impl<F: BlockFetcher> RelayerService<F> {
             verify_policy,
             poll_interval,
         }
-    }
-
-    /// Replace the SR set live. Driver code can refresh on epoch
-    /// transitions (every 7,200 blocks ~ 6h) by calling this.
-    pub fn update_sr_set(&mut self, sr_set: SrSet) {
-        self.sr_set = Some(sr_set);
     }
 
     /// Run the pipeline forever (or until the output channel closes).
@@ -174,7 +184,7 @@ impl<F: BlockFetcher> RelayerService<F> {
         info!(
             poll_interval_ms = self.poll_interval.as_millis() as u64,
             verify_policy = ?self.verify_policy,
-            sr_set_size = self.sr_set.as_ref().map(|s| s.len()).unwrap_or(0),
+            sr_set_size = self.sr_set.borrow().as_ref().map(|s| s.len()).unwrap_or(0),
             "relayer pipeline starting"
         );
 
@@ -231,9 +241,14 @@ impl<F: BlockFetcher> RelayerService<F> {
         let height = decoded.header.height;
         let block_id = decoded.header.block_id;
 
-        // Verify if a policy + SR set is in place.
+        // Verify if a policy + SR set is in place. Snapshot the SR
+        // set out of the watch so we don't hold the read guard across
+        // any await points in the engine path below (and also so that
+        // if a refresh fires mid-tick, we're using the version we
+        // started with).
+        let sr_set_snapshot: Option<SrSet> = self.sr_set.borrow().clone();
         if self.verify_policy != VerifyPolicy::Disabled {
-            if let Some(sr) = &self.sr_set {
+            if let Some(sr) = &sr_set_snapshot {
                 match verify_witness_signature(&decoded.header, sr) {
                     Ok(()) => {
                         metrics::counter!("lightcycle_relay_verify_total", "result" => "ok")
@@ -511,7 +526,7 @@ mod tests {
         let svc = RelayerService::new(
             fetcher,
             small_engine(),
-            None,
+            static_sr_set(None),
             VerifyPolicy::Disabled,
             Duration::from_millis(10),
         );
@@ -556,7 +571,7 @@ mod tests {
         let svc = RelayerService::new(
             fetcher,
             small_engine(),
-            None,
+            static_sr_set(None),
             VerifyPolicy::Disabled,
             Duration::from_millis(10),
         );
@@ -601,7 +616,7 @@ mod tests {
         let svc = RelayerService::new(
             fetcher,
             small_engine(),
-            None,
+            static_sr_set(None),
             VerifyPolicy::Disabled,
             Duration::from_millis(10),
         );
@@ -635,7 +650,7 @@ mod tests {
         let svc = RelayerService::new(
             fetcher,
             small_engine(),
-            None,
+            static_sr_set(None),
             VerifyPolicy::Disabled,
             Duration::from_millis(10),
         );
@@ -661,7 +676,7 @@ mod tests {
         let svc = RelayerService::new(
             fetcher,
             small_engine(),
-            None,
+            static_sr_set(None),
             VerifyPolicy::Disabled,
             Duration::from_millis(10),
         );

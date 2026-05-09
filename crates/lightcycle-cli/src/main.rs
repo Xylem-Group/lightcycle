@@ -134,6 +134,17 @@ struct RelayArgs {
     #[arg(long, env = "LIGHTCYCLE_RELAY_FINALITY_DEPTH", default_value_t = 19)]
     finality_depth: usize,
 
+    /// SR-set refresh interval, seconds. TRON's maintenance period is
+    /// 7,200 blocks ≈ 6h; refreshing every 30 minutes catches an SR
+    /// rotation without stale-set risk. Set to 0 to disable refresh
+    /// (one-shot fetch at startup, suitable for runs <6h).
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_RELAY_SR_REFRESH_SECS",
+        default_value_t = 1800
+    )]
+    sr_refresh_secs: u64,
+
     /// Bind the Firehose v2 gRPC server here. When set, every
     /// emitted Output is broadcast to attached `Stream.Blocks`
     /// subscribers. When unset, the relay runs in log-only mode
@@ -332,7 +343,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         .await
         .with_context(|| format!("gRPC connect: {}", args.grpc_url))?;
 
-    let sr_set = if verify_policy != VerifyPolicy::Disabled {
+    let initial_sr_set = if verify_policy != VerifyPolicy::Disabled {
         let set = source
             .fetch_active_sr_set()
             .await
@@ -344,6 +355,65 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         None
     };
 
+    // Build the SR-set watch channel. The receiver lives inside the
+    // service; the sender lives here so we can push refreshed sets
+    // from the background task.
+    let (sr_set_tx, sr_set_rx) =
+        tokio::sync::watch::channel::<Option<lightcycle_types::SrSet>>(initial_sr_set);
+
+    // Spawn the refresh loop only if (a) verify is on and (b) the
+    // operator didn't explicitly disable refresh by passing 0.
+    let sr_refresh_handle = if verify_policy != VerifyPolicy::Disabled && args.sr_refresh_secs > 0 {
+        // We need a separate gRPC connection for the refresh path
+        // because GrpcBlockFetcher takes ownership of the existing
+        // source.
+        let mut refresh_source = lightcycle_source::GrpcSource::connect(args.grpc_url.clone())
+            .await
+            .with_context(|| {
+                format!("gRPC connect (refresh): {}", args.grpc_url)
+            })?;
+        let interval = std::time::Duration::from_secs(args.sr_refresh_secs);
+        let tx = sr_set_tx.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First tick fires immediately — skip it so we don't
+            // re-fetch right after the startup fetch.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match refresh_source.fetch_active_sr_set().await {
+                    Ok(set) => {
+                        tracing::info!(size = set.len(), "SR set refreshed");
+                        metrics::counter!(
+                            "lightcycle_relay_sr_set_refreshes_total",
+                            "result" => "ok"
+                        )
+                        .increment(1);
+                        if tx.send(Some(set)).is_err() {
+                            tracing::info!("SR-set channel closed; refresh task exiting");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SR set refresh failed; will retry");
+                        metrics::counter!(
+                            "lightcycle_relay_sr_set_refreshes_total",
+                            "result" => "error"
+                        )
+                        .increment(1);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    metrics::describe_counter!(
+        "lightcycle_relay_sr_set_refreshes_total",
+        "SR-set refresh attempts, labelled by result"
+    );
+
     let engine = ReorgEngine::new(ReorgConfig {
         buffer_window: args.buffer_window,
         finality_depth: args.finality_depth,
@@ -352,7 +422,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
     let service = RelayerService::new(
         fetcher,
         engine,
-        sr_set,
+        sr_set_rx,
         verify_policy,
         std::time::Duration::from_millis(args.poll_interval_ms.max(50)),
     );
@@ -418,6 +488,10 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_handle).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pump_handle).await;
     }
+    if let Some(h) = sr_refresh_handle {
+        h.abort();
+    }
+    drop(sr_set_tx); // drop the sender so any lingering refresh recv() exits
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), service_handle).await;
     Ok(())
 }
