@@ -168,6 +168,21 @@ struct RelayArgs {
     /// roughly an hour of TRON blocks at 3s spacing.
     #[arg(long, env = "LIGHTCYCLE_RELAY_HUB_CAPACITY", default_value_t = 1024)]
     firehose_hub_capacity: usize,
+
+    /// Whether to fetch the `TransactionInfo` side channel for each
+    /// block (logs, internal txs, resource accounting). Default true:
+    /// the dominant TRC-20 / TRC-721 indexing use case needs it. Set
+    /// false to halve the per-tick RPC cost when consumers don't read
+    /// `Transaction.info`. The relayer soft-degrades on tx-info RPC
+    /// errors regardless (block ships with empty info, logged + counted),
+    /// so this flag is for explicit-disable rather than fault-tolerance.
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_RELAY_FETCH_TX_INFO",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    fetch_tx_info: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -418,7 +433,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         buffer_window: args.buffer_window,
         finality_depth: args.finality_depth,
     });
-    let fetcher = GrpcBlockFetcher::new(source);
+    let fetcher = GrpcBlockFetcher::new(source).with_fetch_tx_info(args.fetch_tx_info);
     let service = RelayerService::new(
         fetcher,
         engine,

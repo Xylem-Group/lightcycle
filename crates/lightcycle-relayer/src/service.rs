@@ -53,7 +53,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lightcycle_codec::{decode_block_message, verify_witness_signature, CodecError, DecodedBlock};
+use lightcycle_codec::{
+    decode_block_message, decode_transaction_info_list_message, verify_witness_signature,
+    CodecError, DecodedBlock, DecodedTxInfo,
+};
 use lightcycle_source::GrpcSource;
 use lightcycle_types::SrSet;
 use thiserror::Error;
@@ -77,32 +80,111 @@ impl Default for VerifyPolicy {
     }
 }
 
+/// What `BlockFetcher` returns: the decoded block plus the side-channel
+/// `TransactionInfo` payload (logs, internal txs, resource accounting)
+/// joined by tx-id at the firehose encoder layer. `tx_infos` is empty
+/// when the fetcher is configured without tx-info fetching, when the
+/// upstream returned no info (empty block), or when the tx-info RPC
+/// failed and the fetcher chose to soft-degrade.
+#[derive(Debug, Clone)]
+pub struct FetchedBlock {
+    pub decoded: DecodedBlock,
+    pub tx_infos: Vec<DecodedTxInfo>,
+}
+
 /// Source abstraction the service consumes. Production wires this to
 /// `GrpcSource` via [`GrpcBlockFetcher`]; tests provide a vec-backed
 /// implementation.
 #[async_trait]
 pub trait BlockFetcher: Send {
-    async fn fetch_now_block(&mut self) -> Result<DecodedBlock>;
+    async fn fetch_now_block(&mut self) -> Result<FetchedBlock>;
 }
 
-/// Production adapter: hits java-tron's `Wallet.GetNowBlock`, decodes
+/// Production adapter: hits java-tron's `Wallet.GetNowBlock` and
+/// (optionally) `Wallet.GetTransactionInfoByBlockNum`, decodes both
 /// via the codec.
+///
+/// `fetch_tx_info` controls whether the second RPC fires. When false,
+/// `FetchedBlock.tx_infos` is always empty. When true, a tx-info
+/// RPC failure soft-degrades to empty `tx_infos` (logged + counted)
+/// rather than failing the whole tick — losing logs is preferable
+/// to halting the stream over a transient upstream issue.
 #[derive(Debug)]
 pub struct GrpcBlockFetcher {
     source: GrpcSource,
+    fetch_tx_info: bool,
 }
 
 impl GrpcBlockFetcher {
     pub fn new(source: GrpcSource) -> Self {
-        Self { source }
+        Self {
+            source,
+            fetch_tx_info: true,
+        }
+    }
+
+    /// Override the default of fetching tx-info. The CLI exposes this
+    /// as `--no-fetch-tx-info`.
+    pub fn with_fetch_tx_info(mut self, fetch_tx_info: bool) -> Self {
+        self.fetch_tx_info = fetch_tx_info;
+        self
     }
 }
 
 #[async_trait]
 impl BlockFetcher for GrpcBlockFetcher {
-    async fn fetch_now_block(&mut self) -> Result<DecodedBlock> {
+    async fn fetch_now_block(&mut self) -> Result<FetchedBlock> {
         let block = self.source.fetch_now_block().await?;
-        Ok(decode_block_message(&block).context("codec decode failed")?)
+        let decoded = decode_block_message(&block).context("codec decode failed")?;
+
+        let tx_infos = if self.fetch_tx_info && !decoded.transactions.is_empty() {
+            match self
+                .source
+                .fetch_transaction_info_by_block_num(decoded.header.height)
+                .await
+            {
+                Ok(list) => match decode_transaction_info_list_message(&list) {
+                    Ok(infos) => {
+                        metrics::counter!(
+                            "lightcycle_relay_tx_info_fetch_total",
+                            "result" => "ok"
+                        )
+                        .increment(1);
+                        infos
+                    }
+                    Err(e) => {
+                        warn!(
+                            height = decoded.header.height,
+                            error = %e,
+                            "tx-info decode failed; emitting block without info"
+                        );
+                        metrics::counter!(
+                            "lightcycle_relay_tx_info_fetch_total",
+                            "result" => "decode_error"
+                        )
+                        .increment(1);
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        height = decoded.header.height,
+                        error = %e,
+                        "tx-info RPC failed; emitting block without info"
+                    );
+                    metrics::counter!(
+                        "lightcycle_relay_tx_info_fetch_total",
+                        "result" => "rpc_error"
+                    )
+                    .increment(1);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        Ok(FetchedBlock { decoded, tx_infos })
     }
 }
 
@@ -213,7 +295,7 @@ impl<F: BlockFetcher> RelayerService<F> {
     }
 
     async fn tick_once(&mut self, output_tx: &mpsc::Sender<Output>) -> Result<(), ServiceError> {
-        let decoded = self
+        let fetched = self
             .fetcher
             .fetch_now_block()
             .await
@@ -223,21 +305,22 @@ impl<F: BlockFetcher> RelayerService<F> {
         // tip, nothing to do. Cheaper than going through the engine
         // and coming back with a DuplicateBlock error.
         if let Some(tip) = self.engine.tip() {
-            if tip.block_id == decoded.header.block_id {
+            if tip.block_id == fetched.decoded.header.block_id {
                 metrics::counter!("lightcycle_relay_polls_total", "result" => "duplicate")
                     .increment(1);
                 return Ok(());
             }
         }
 
-        self.process_one(decoded, output_tx).await
+        self.process_one(fetched, output_tx).await
     }
 
     async fn process_one(
         &mut self,
-        decoded: DecodedBlock,
+        fetched: FetchedBlock,
         output_tx: &mpsc::Sender<Output>,
     ) -> Result<(), ServiceError> {
+        let FetchedBlock { decoded, tx_infos } = fetched;
         let height = decoded.header.height;
         let block_id = decoded.header.block_id;
 
@@ -309,7 +392,7 @@ impl<F: BlockFetcher> RelayerService<F> {
         }
 
         // Feed the engine.
-        match self.engine.accept(decoded) {
+        match self.engine.accept(decoded, tx_infos) {
             Ok(outputs) => {
                 for output in outputs {
                     log_output(&output);
@@ -430,6 +513,10 @@ pub fn describe_metrics() {
         "lightcycle_relay_engine_buffer_depth",
         "current canonical-buffer depth in the reorg engine"
     );
+    metrics::describe_counter!(
+        "lightcycle_relay_tx_info_fetch_total",
+        "tx-info side-channel fetches, labelled by result (ok|rpc_error|decode_error)"
+    );
 }
 
 #[cfg(test)]
@@ -444,23 +531,32 @@ mod tests {
     /// Vec-backed mock fetcher: returns blocks in the order they were
     /// pushed, then errors on `fetch_now_block` once exhausted.
     /// Implements `Clone` via Arc<Mutex<...>> so we can hand the same
-    /// queue to a test harness and the service.
+    /// queue to a test harness and the service. Tests that don't need
+    /// tx_infos can use [`Self::new`] which defaults them to empty;
+    /// tests covering the join path use [`Self::new_with_infos`].
     #[derive(Clone)]
     struct ScriptedFetcher {
-        queue: Arc<Mutex<Vec<DecodedBlock>>>,
+        queue: Arc<Mutex<Vec<FetchedBlock>>>,
     }
 
     impl ScriptedFetcher {
         fn new(blocks: Vec<DecodedBlock>) -> Self {
+            let fetched = blocks
+                .into_iter()
+                .map(|decoded| FetchedBlock {
+                    decoded,
+                    tx_infos: Vec::new(),
+                })
+                .collect();
             Self {
-                queue: Arc::new(Mutex::new(blocks)),
+                queue: Arc::new(Mutex::new(fetched)),
             }
         }
     }
 
     #[async_trait]
     impl BlockFetcher for ScriptedFetcher {
-        async fn fetch_now_block(&mut self) -> Result<DecodedBlock> {
+        async fn fetch_now_block(&mut self) -> Result<FetchedBlock> {
             let mut q = self.queue.lock().await;
             if q.is_empty() {
                 anyhow::bail!("scripted queue exhausted");

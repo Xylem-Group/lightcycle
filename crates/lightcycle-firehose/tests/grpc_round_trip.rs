@@ -42,6 +42,7 @@ fn synth_output(step: Step, height: u64) -> Output {
             },
             transactions: vec![],
         },
+        tx_infos: vec![],
     };
     let sb = StreamableBlock {
         step,

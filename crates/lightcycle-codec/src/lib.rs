@@ -57,6 +57,6 @@ pub use events::{
 pub use sigverify::{recover_witness_address, verify_witness_signature};
 pub use transaction::{ContractKind, DecodedContract, DecodedTransaction};
 pub use tx_info::{
-    decode_transaction_info, decode_transaction_info_list, decode_transaction_info_message,
-    CallValueInfo, DecodedTxInfo, InternalTx, Log, ResourceCost,
+    decode_transaction_info, decode_transaction_info_list, decode_transaction_info_list_message,
+    decode_transaction_info_message, CallValueInfo, DecodedTxInfo, InternalTx, Log, ResourceCost,
 };

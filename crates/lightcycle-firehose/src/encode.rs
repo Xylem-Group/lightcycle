@@ -5,32 +5,52 @@
 //! block and produces a freshly-allocated proto message. No I/O, no
 //! async, no error returns — every input shape is encodable.
 //!
-//! What's populated and what's not:
+//! What's populated:
 //!
-//! - **Block + Header + Transaction + Contract**: fully populated from
-//!   `DecodedBlock`. The four high-volume contract types
-//!   (`Transfer`, `TransferAsset`, `TriggerSmartContract`,
-//!   `CreateSmartContract`) get their typed payload variants;
-//!   everything else lands in the `OtherPayload` oneof variant with
-//!   the original `Any.value` bytes preserved + the wire `kind` tag in
-//!   `Contract.unknown_kind` so consumers can route to the right
-//!   java-tron-specific decoder.
+//! - **Block + Header + Transaction + Contract**: from `DecodedBlock`.
+//!   The four high-volume contract types (`Transfer`, `TransferAsset`,
+//!   `TriggerSmartContract`, `CreateSmartContract`) get their typed
+//!   payload variants; everything else lands in the `OtherPayload`
+//!   oneof variant with the original `Any.value` bytes preserved + the
+//!   wire `kind` tag in `Contract.unknown_kind` so consumers can route
+//!   to the right java-tron-specific decoder.
 //!
-//! - **Transaction.info**: left `None`. v0.1 of the ingest pipeline
-//!   does NOT fetch java-tron's `getTransactionInfoByBlockNum` side
-//!   channel, so logs / internal txs / resource accounting are unknown
-//!   at this layer. When ingest is extended, this encoder gains the
-//!   join responsibility — the proto shape stays unchanged so existing
-//!   consumers transparently start seeing populated `info`.
+//! - **Transaction.info**: from `BufferedBlock.tx_infos`, joined by
+//!   tx hash. The TRC-20 / TRC-721 indexing path needs `info.logs`;
+//!   resource-cost accounting reads `info.resource`. When the upstream
+//!   `getTransactionInfoByBlockNum` RPC failed (or the relayer ran
+//!   with `--no-fetch-tx-info`), `tx_infos` is empty and every
+//!   `Transaction.info` is `None` — same observable shape as before
+//!   tx-info ingest landed.
+//!
+//! Tx-info ordering is NOT guaranteed to match the block's tx order
+//! on the wire, so the encoder builds a hash-map by tx hash and
+//! removes entries as it joins. A tx in the block with no matching
+//! info gets `info = None`. An info with no matching tx in the block
+//! is currently dropped silently (never observed in mainnet samples,
+//! but logging the rate would help if it ever happens).
 
-use lightcycle_codec::{DecodedContract, DecodedTransaction};
+use std::collections::HashMap;
+
+use lightcycle_codec::{DecodedContract, DecodedTransaction, DecodedTxInfo};
 use lightcycle_proto::sf::tron::type_v1 as pb;
 use lightcycle_relayer::BufferedBlock;
+use lightcycle_types::TxHash;
 use prost_types::Timestamp;
 
 /// Encode a buffered block into `sf.tron.type.v1.Block`.
 pub fn encode_block(buffered: &BufferedBlock) -> pb::Block {
     let header = &buffered.decoded.header;
+
+    // Build a lookup keyed by tx hash so the per-tx encoder can join
+    // its `info` in O(1). HashMap rather than sort-and-binary-search:
+    // mainnet block density (10–500 txs) makes the constant factor
+    // win out and the code stays simpler.
+    let info_by_hash: HashMap<TxHash, &DecodedTxInfo> = buffered
+        .tx_infos
+        .iter()
+        .map(|i| (i.tx_hash, i))
+        .collect();
 
     pb::Block {
         number: buffered.height,
@@ -48,12 +68,15 @@ pub fn encode_block(buffered: &BufferedBlock) -> pb::Block {
             .decoded
             .transactions
             .iter()
-            .map(encode_transaction)
+            .map(|tx| encode_transaction(tx, info_by_hash.get(&tx.hash).copied()))
             .collect(),
     }
 }
 
-fn encode_transaction(tx: &DecodedTransaction) -> pb::Transaction {
+fn encode_transaction(
+    tx: &DecodedTransaction,
+    info: Option<&DecodedTxInfo>,
+) -> pb::Transaction {
     pb::Transaction {
         id: tx.hash.0.to_vec(),
         timestamp_ms: tx.timestamp_ms,
@@ -61,8 +84,56 @@ fn encode_transaction(tx: &DecodedTransaction) -> pb::Transaction {
         fee_limit_sun: tx.fee_limit_sun,
         contracts: tx.contracts.iter().map(encode_contract).collect(),
         signatures: tx.signatures.clone(),
-        // v0.1 ingest doesn't fetch TransactionInfo. See module docs.
-        info: None,
+        info: info.map(encode_tx_info),
+    }
+}
+
+fn encode_tx_info(info: &DecodedTxInfo) -> pb::TransactionInfo {
+    let resource = pb::ResourceCost {
+        energy_usage: info.resource.energy_usage,
+        energy_fee: info.resource.energy_fee,
+        origin_energy_usage: info.resource.origin_energy_usage,
+        energy_usage_total: info.resource.energy_usage_total,
+        net_usage: info.resource.net_usage,
+        net_fee: info.resource.net_fee,
+        energy_penalty_total: info.resource.energy_penalty_total,
+    };
+    pb::TransactionInfo {
+        success: info.success,
+        fee_sun: info.fee_sun,
+        contract_address: info
+            .contract_address
+            .map(|a| a.0.to_vec())
+            .unwrap_or_default(),
+        resource: Some(resource),
+        logs: info
+            .logs
+            .iter()
+            .map(|l| pb::Log {
+                address: l.address.0.to_vec(),
+                topics: l.topics.iter().map(|t| t.to_vec()).collect(),
+                data: l.data.clone(),
+            })
+            .collect(),
+        internal_transactions: info
+            .internal_transactions
+            .iter()
+            .map(|i| pb::InternalTx {
+                hash: i.hash.to_vec(),
+                caller: i.caller.0.to_vec(),
+                transfer_to: i.transfer_to.0.to_vec(),
+                call_values: i
+                    .call_values
+                    .iter()
+                    .map(|c| pb::CallValue {
+                        call_value: c.call_value,
+                        token_id: c.token_id.clone(),
+                    })
+                    .collect(),
+                rejected: i.rejected,
+                note: i.note.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -174,6 +245,14 @@ mod tests {
     }
 
     fn synth_buffered(height: u64, contracts: Vec<DecodedContract>) -> BufferedBlock {
+        synth_buffered_with_infos(height, contracts, vec![])
+    }
+
+    fn synth_buffered_with_infos(
+        height: u64,
+        contracts: Vec<DecodedContract>,
+        tx_infos: Vec<DecodedTxInfo>,
+    ) -> BufferedBlock {
         let tx = DecodedTransaction {
             hash: TxHash([0xaa; 32]),
             timestamp_ms: 1_777_854_558_100,
@@ -201,6 +280,7 @@ mod tests {
                 },
                 transactions: vec![tx],
             },
+            tx_infos,
         }
     }
 
@@ -302,16 +382,93 @@ mod tests {
     }
 
     #[test]
-    fn tx_info_field_is_unset_in_v01_pipeline() {
-        // Documents the v0.1 boundary: ingest doesn't fetch
-        // TransactionInfo, so the proto's `info` field must be None
-        // for now. When ingest is extended, this assertion gets
-        // updated.
+    fn tx_info_unset_when_buffered_block_has_no_infos() {
+        // When the relayer ran without tx-info fetching (or the RPC
+        // failed), tx_infos is empty and every Transaction.info must
+        // remain None — same shape as before tx-info ingest landed,
+        // so consumers don't see spurious empty-but-Some payloads.
         let buf = synth_buffered(82_500_006, vec![]);
         let pb = encode_block(&buf);
         for tx in &pb.transactions {
-            assert!(tx.info.is_none(), "info should be unset in v0.1");
+            assert!(tx.info.is_none());
         }
+    }
+
+    #[test]
+    fn tx_info_joins_by_hash_and_populates_all_fields() {
+        use lightcycle_codec::{InternalTx, Log, ResourceCost};
+        // tx_infos arrive in arbitrary order relative to block.transactions;
+        // here the synthetic block has one tx with hash [0xaa; 32], and
+        // we attach a populated DecodedTxInfo with that hash.
+        let info = DecodedTxInfo {
+            tx_hash: TxHash([0xaa; 32]),
+            block_height: 82_500_010,
+            block_timestamp_ms: 1_777_854_558_345,
+            fee_sun: 7_777_777,
+            success: true,
+            contract_address: Some(addr(0x55)),
+            resource: ResourceCost {
+                energy_usage: 11_000,
+                energy_fee: 0,
+                origin_energy_usage: 0,
+                energy_usage_total: 11_000,
+                net_usage: 268,
+                net_fee: 0,
+                energy_penalty_total: 0,
+            },
+            logs: vec![Log {
+                address: addr(0x55),
+                topics: vec![[0xa9; 32], [0xb0; 32], [0xc1; 32]],
+                data: vec![0xde, 0xad, 0xbe, 0xef],
+            }],
+            internal_transactions: vec![InternalTx {
+                hash: [0x42; 32],
+                caller: addr(0x55),
+                transfer_to: addr(0x66),
+                call_values: vec![lightcycle_codec::CallValueInfo {
+                    call_value: 100,
+                    token_id: String::new(),
+                }],
+                rejected: false,
+                note: b"call".to_vec(),
+            }],
+        };
+        let buf = synth_buffered_with_infos(82_500_010, vec![], vec![info.clone()]);
+        let pb = encode_block(&buf);
+        let pb_info = pb.transactions[0].info.as_ref().expect("info populated");
+        assert!(pb_info.success);
+        assert_eq!(pb_info.fee_sun, 7_777_777);
+        assert_eq!(pb_info.contract_address, addr(0x55).0.to_vec());
+        let res = pb_info.resource.expect("resource");
+        assert_eq!(res.energy_usage_total, 11_000);
+        assert_eq!(res.net_usage, 268);
+        assert_eq!(pb_info.logs.len(), 1);
+        assert_eq!(pb_info.logs[0].topics.len(), 3);
+        assert_eq!(pb_info.logs[0].data, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(pb_info.internal_transactions.len(), 1);
+        assert_eq!(pb_info.internal_transactions[0].rejected, false);
+        assert_eq!(pb_info.internal_transactions[0].call_values[0].call_value, 100);
+    }
+
+    #[test]
+    fn tx_with_no_matching_info_keeps_info_none() {
+        // tx_infos may not cover every tx (e.g. partial fetch error).
+        // Encoder must leave info=None for unmatched txs rather than
+        // pulling the wrong info or panicking.
+        let mismatched_info = DecodedTxInfo {
+            tx_hash: TxHash([0xee; 32]), // doesn't match the block's [0xaa; 32]
+            block_height: 82_500_011,
+            block_timestamp_ms: 1_777_854_558_345,
+            fee_sun: 0,
+            success: true,
+            contract_address: None,
+            resource: lightcycle_codec::ResourceCost::default(),
+            logs: vec![],
+            internal_transactions: vec![],
+        };
+        let buf = synth_buffered_with_infos(82_500_011, vec![], vec![mismatched_info]);
+        let pb = encode_block(&buf);
+        assert!(pb.transactions[0].info.is_none());
     }
 
     #[test]

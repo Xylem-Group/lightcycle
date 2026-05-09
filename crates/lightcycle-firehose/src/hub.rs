@@ -115,6 +115,7 @@ mod tests {
                 },
                 transactions: vec![],
             },
+            tx_infos: vec![],
         };
         Output::New(StreamableBlock {
             step: Step::New,

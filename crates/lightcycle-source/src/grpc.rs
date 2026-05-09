@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use lightcycle_proto::tron::api::wallet_client::WalletClient;
-use lightcycle_proto::tron::protocol::{Block, EmptyMessage, NumberMessage};
+use lightcycle_proto::tron::protocol::{Block, EmptyMessage, NumberMessage, TransactionInfoList};
 use lightcycle_types::{Address, SrSet};
 use tonic::transport::Channel;
 
@@ -78,6 +78,30 @@ impl GrpcSource {
             .get_now_block(EmptyMessage {})
             .await
             .context("get_now_block rpc failed")?;
+        Ok(resp.into_inner())
+    }
+
+    /// Fetch the `TransactionInfo` side channel for every tx in a
+    /// block. Returns the prost `TransactionInfoList` message verbatim;
+    /// the relayer joins these against the block's transactions by
+    /// tx-id and feeds the result through the codec.
+    ///
+    /// Open in BOTH FullNode and LiteFullNode modes for any block
+    /// java-tron currently has in memory (recent head + the lite
+    /// node's retained range). Empty list when the block has no txs
+    /// or the height is beyond what the node retained.
+    pub async fn fetch_transaction_info_by_block_num(
+        &mut self,
+        height: u64,
+    ) -> Result<TransactionInfoList> {
+        let req = NumberMessage {
+            num: i64::try_from(height).context("height exceeds i64::MAX")?,
+        };
+        let resp = self
+            .client
+            .get_transaction_info_by_block_num(req)
+            .await
+            .context("get_transaction_info_by_block_num rpc failed")?;
         Ok(resp.into_inner())
     }
 

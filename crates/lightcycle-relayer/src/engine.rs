@@ -28,7 +28,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use lightcycle_codec::DecodedBlock;
+use lightcycle_codec::{DecodedBlock, DecodedTxInfo};
 use lightcycle_types::{BlockHeight, BlockId, Step};
 use thiserror::Error;
 
@@ -50,6 +50,15 @@ pub struct BufferedBlock {
     /// The decoded body. Cloned by value into outputs (Arc-wrap
     /// upstream if cloning becomes a hot-path concern).
     pub decoded: DecodedBlock,
+    /// Side-channel `TransactionInfo` for the txs in `decoded`,
+    /// fetched from java-tron's `getTransactionInfoByBlockNum` and
+    /// joined by the service before the engine sees the block.
+    /// Order is NOT guaranteed to match `decoded.transactions`; the
+    /// firehose encoder joins by tx hash. Empty when the service is
+    /// running with `--no-fetch-tx-info` or when the upstream
+    /// returned no info (e.g. an empty block, or a node that doesn't
+    /// expose the tx-info RPC).
+    pub tx_infos: Vec<DecodedTxInfo>,
 }
 
 /// One ordered event emitted by the engine. Consumers iterate the
@@ -189,7 +198,16 @@ impl ReorgEngine {
     /// The ingest entry point. Returns the ordered events to forward
     /// to downstream consumers, or a typed error if the block can't
     /// be incorporated. On error, internal state is unchanged.
-    pub fn accept(&mut self, decoded: DecodedBlock) -> Result<Vec<Output>, ReorgError> {
+    ///
+    /// `tx_infos` is the side-channel `TransactionInfo` payload for the
+    /// txs in `decoded`, joined by the service before the engine sees
+    /// the block. Pass an empty `Vec` when the service is running
+    /// without tx-info fetching.
+    pub fn accept(
+        &mut self,
+        decoded: DecodedBlock,
+        tx_infos: Vec<DecodedTxInfo>,
+    ) -> Result<Vec<Output>, ReorgError> {
         let height = decoded.header.height;
         let block_id = decoded.header.block_id;
         let parent_id = decoded.header.parent_id;
@@ -200,20 +218,20 @@ impl ReorgEngine {
 
         // First block: trust it as canonical, set the fork.
         if self.canonical.is_empty() {
-            return Ok(self.push_canonical_first(decoded));
+            return Ok(self.push_canonical_first(decoded, tx_infos));
         }
 
         let tip = self.canonical.back().expect("non-empty checked above");
 
         // Linear extension: cheapest path, the common case at chain head.
         if parent_id == tip.block_id {
-            return Ok(self.extend_canonical(decoded));
+            return Ok(self.extend_canonical(decoded, tx_infos));
         }
 
         // Reorg candidate: parent is somewhere in our canonical buffer
         // but not at the tip. Walk to find the ancestor index.
         if self.canonical_ids.contains(&parent_id) {
-            return self.handle_reorg(decoded);
+            return self.handle_reorg(decoded, tx_infos);
         }
 
         // Otherwise we don't know this block's parent. Either we have
@@ -226,13 +244,18 @@ impl ReorgEngine {
         })
     }
 
-    fn push_canonical_first(&mut self, decoded: DecodedBlock) -> Vec<Output> {
+    fn push_canonical_first(
+        &mut self,
+        decoded: DecodedBlock,
+        tx_infos: Vec<DecodedTxInfo>,
+    ) -> Vec<Output> {
         let buffered = BufferedBlock {
             height: decoded.header.height,
             block_id: decoded.header.block_id,
             parent_id: decoded.header.parent_id,
             fork_id: self.alloc_fork_id(),
             decoded,
+            tx_infos,
         };
         self.canonical_ids.insert(buffered.block_id);
         let cursor = Cursor::new(buffered.height, buffered.block_id);
@@ -248,13 +271,18 @@ impl ReorgEngine {
         out
     }
 
-    fn extend_canonical(&mut self, decoded: DecodedBlock) -> Vec<Output> {
+    fn extend_canonical(
+        &mut self,
+        decoded: DecodedBlock,
+        tx_infos: Vec<DecodedTxInfo>,
+    ) -> Vec<Output> {
         let buffered = BufferedBlock {
             height: decoded.header.height,
             block_id: decoded.header.block_id,
             parent_id: decoded.header.parent_id,
             fork_id: self.alloc_fork_id(),
             decoded,
+            tx_infos,
         };
         self.canonical_ids.insert(buffered.block_id);
         let cursor = Cursor::new(buffered.height, buffered.block_id);
@@ -269,7 +297,11 @@ impl ReorgEngine {
         out
     }
 
-    fn handle_reorg(&mut self, decoded: DecodedBlock) -> Result<Vec<Output>, ReorgError> {
+    fn handle_reorg(
+        &mut self,
+        decoded: DecodedBlock,
+        tx_infos: Vec<DecodedTxInfo>,
+    ) -> Result<Vec<Output>, ReorgError> {
         // Find the ancestor block_id in canonical.back-to-front order.
         // ancestor_idx is the index of the block whose id == parent_id.
         let parent_id = decoded.header.parent_id;
@@ -285,7 +317,7 @@ impl ReorgEngine {
         if undo_count == 0 {
             // Means parent_id == tip.id, but we already short-circuited
             // that path. Defensive: treat as linear extension.
-            return Ok(self.extend_canonical(decoded));
+            return Ok(self.extend_canonical(decoded, tx_infos));
         }
 
         // Refuse reorg if it would orphan a finalized block.
@@ -328,6 +360,7 @@ impl ReorgEngine {
             parent_id: decoded.header.parent_id,
             fork_id: self.alloc_fork_id(),
             decoded,
+            tx_infos,
         };
         self.canonical_ids.insert(buffered.block_id);
         let cursor = Cursor::new(buffered.height, buffered.block_id);
@@ -426,13 +459,21 @@ mod tests {
         })
     }
 
+    /// Test convenience: most engine tests don't exercise the
+    /// `tx_infos` join, so this wraps the real `accept` with an empty
+    /// vec. Tests that DO need to verify tx_info preservation through
+    /// the engine call `engine.accept(decoded, tx_infos)` directly.
+    fn accept(engine: &mut ReorgEngine, b: DecodedBlock) -> Result<Vec<Output>, ReorgError> {
+        engine.accept(b, Vec::new())
+    }
+
     #[test]
     fn linear_extension_emits_new_per_block() {
         let mut e = small_engine();
         let mut prev = id(99, 0);
         for h in 100..103 {
             let b = synth_block(h, id(h, 0xa), prev);
-            let outs = e.accept(b).expect("accept");
+            let outs = accept(&mut e, b).expect("accept");
             // First two heights: just NEW. Third (which crosses no
             // boundary yet — finality_depth=3 means we need 4 total
             // before emission) also just NEW.
@@ -452,7 +493,7 @@ mod tests {
         let mut all_outputs = Vec::new();
         for h in 100..104 {
             let b = synth_block(h, id(h, 0xa), prev);
-            all_outputs.extend(e.accept(b).expect("accept"));
+            all_outputs.extend(accept(&mut e, b).expect("accept"));
             prev = id(h, 0xa);
         }
         // Expected: NEW(100), NEW(101), NEW(102), NEW(103) + IRREVERSIBLE(100).
@@ -484,7 +525,7 @@ mod tests {
         let mut buf = Vec::new();
         for h in 100..106 {
             let b = synth_block(h, id(h, 0xa), prev);
-            buf.extend(e.accept(b).expect("accept"));
+            buf.extend(accept(&mut e, b).expect("accept"));
             prev = id(h, 0xa);
         }
         let irrev_heights: Vec<_> = buf
@@ -503,12 +544,11 @@ mod tests {
         // Build canonical up to height 102 on fork 'a'.
         let mut prev = id(99, 0);
         for h in 100..103 {
-            e.accept(synth_block(h, id(h, 0xa), prev)).unwrap();
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
         // Now arrive a sibling 102b, parent = 101a. Should UNDO 102a + NEW 102b.
-        let outs = e
-            .accept(synth_block(102, id(102, 0xb), id(101, 0xa)))
+        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
             .expect("accept reorg");
         assert_eq!(outs.len(), 2);
         match (&outs[0], &outs[1]) {
@@ -529,13 +569,12 @@ mod tests {
         // Canonical to 103a.
         let mut prev = id(99, 0);
         for h in 100..104 {
-            e.accept(synth_block(h, id(h, 0xa), prev)).unwrap();
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
         // Branch from 101a: arrive a single new block at height 102b.
         // Should UNDO 103a then UNDO 102a then NEW 102b.
-        let outs = e
-            .accept(synth_block(102, id(102, 0xb), id(101, 0xa)))
+        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
             .expect("accept");
         let kinds: Vec<_> = outs
             .iter()
@@ -563,14 +602,13 @@ mod tests {
         let mut e = small_engine();
         let mut prev = id(99, 0);
         for h in 100..107 {
-            e.accept(synth_block(h, id(h, 0xa), prev)).unwrap();
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
         // Now try to fork at 102a — its child 103a is below finality.
         // canonical_ids contains 102a; the reorg path runs but the
         // earliest-orphan check fires.
-        let err = e
-            .accept(synth_block(103, id(103, 0xb), id(102, 0xa)))
+        let err = accept(&mut e, synth_block(103, id(103, 0xb), id(102, 0xa)))
             .unwrap_err();
         assert!(
             matches!(err, ReorgError::ReorgBelowFinality { .. }),
@@ -583,10 +621,9 @@ mod tests {
     #[test]
     fn parent_not_in_buffer_returns_typed_error() {
         let mut e = small_engine();
-        e.accept(synth_block(100, id(100, 0xa), id(99, 0))).unwrap();
+        accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0))).unwrap();
         // Skip 101; deliver 102 with parent 101 (which we never saw).
-        let err = e
-            .accept(synth_block(102, id(102, 0xa), id(101, 0xa)))
+        let err = accept(&mut e, synth_block(102, id(102, 0xa), id(101, 0xa)))
             .unwrap_err();
         match err {
             ReorgError::ParentNotInBuffer {
@@ -602,8 +639,8 @@ mod tests {
     fn duplicate_block_returns_error_no_state_change() {
         let mut e = small_engine();
         let b = synth_block(100, id(100, 0xa), id(99, 0));
-        e.accept(b.clone()).unwrap();
-        let err = e.accept(b).unwrap_err();
+        accept(&mut e, b.clone()).unwrap();
+        let err = accept(&mut e, b).unwrap_err();
         assert!(matches!(err, ReorgError::DuplicateBlock { .. }));
         assert_eq!(e.len(), 1);
     }
@@ -614,7 +651,7 @@ mod tests {
         let mut e = small_engine();
         let mut prev = id(99, 0);
         for h in 100..108 {
-            e.accept(synth_block(h, id(h, 0xa), prev)).unwrap();
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
         assert_eq!(e.len(), 5);
@@ -626,8 +663,7 @@ mod tests {
     #[test]
     fn cursor_carries_height_and_block_id() {
         let mut e = small_engine();
-        let outs = e
-            .accept(synth_block(100, id(100, 0xa), id(99, 0)))
+        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0)))
             .unwrap();
         match &outs[0] {
             Output::New(s) => {
@@ -643,11 +679,10 @@ mod tests {
         let mut e = small_engine();
         let mut prev = id(99, 0);
         for h in 100..103 {
-            e.accept(synth_block(h, id(h, 0xa), prev)).unwrap();
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
-        let outs = e
-            .accept(synth_block(102, id(102, 0xb), id(101, 0xa)))
+        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
             .unwrap();
         // Find the New(102b) and confirm its fork_id differs from
         // whatever 102a got. We don't assert specific values (the
@@ -668,5 +703,39 @@ mod tests {
             })
             .unwrap();
         assert_ne!(new_b_fork_id, undo_a_fork_id);
+    }
+
+    #[test]
+    fn tx_infos_are_preserved_into_buffered_block() {
+        // Engine doesn't inspect tx_infos but must round-trip them
+        // verbatim onto the BufferedBlock that ships in the Output —
+        // otherwise the firehose encoder has nothing to populate
+        // Transaction.info from. Use a non-empty marker to detect
+        // truncation/replacement.
+        use lightcycle_codec::{DecodedTxInfo, ResourceCost};
+        use lightcycle_types::{Address, TxHash};
+
+        let mut e = small_engine();
+        let block = synth_block(100, id(100, 0xa), id(99, 0));
+        let infos = vec![DecodedTxInfo {
+            tx_hash: TxHash([0x42; 32]),
+            block_height: 100,
+            block_timestamp_ms: 1_777_854_558_000,
+            fee_sun: 1_000_000,
+            success: true,
+            contract_address: Some(Address([0x41; 21])),
+            resource: ResourceCost::default(),
+            logs: vec![],
+            internal_transactions: vec![],
+        }];
+        let outs = e.accept(block, infos.clone()).unwrap();
+        match &outs[0] {
+            Output::New(s) => {
+                assert_eq!(s.block.tx_infos.len(), 1);
+                assert_eq!(s.block.tx_infos[0].tx_hash, infos[0].tx_hash);
+                assert_eq!(s.block.tx_infos[0].fee_sun, 1_000_000);
+            }
+            _ => panic!("expected New"),
+        }
     }
 }

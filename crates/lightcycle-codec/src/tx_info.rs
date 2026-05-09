@@ -204,6 +204,15 @@ pub fn decode_transaction_info_message(info: &protocol::TransactionInfo) -> Resu
 /// `GetTransactionInfoByBlockNum`) into per-tx [`DecodedTxInfo`].
 pub fn decode_transaction_info_list(raw: &[u8]) -> Result<Vec<DecodedTxInfo>> {
     let list = protocol::TransactionInfoList::decode(raw)?;
+    decode_transaction_info_list_message(&list)
+}
+
+/// Decode an already-parsed `TransactionInfoList` prost message.
+/// Source layer hands us this directly off the gRPC stub via
+/// `WalletClient::get_transaction_info_by_block_num`.
+pub fn decode_transaction_info_list_message(
+    list: &protocol::TransactionInfoList,
+) -> Result<Vec<DecodedTxInfo>> {
     list.transaction_info
         .iter()
         .map(decode_transaction_info_message)

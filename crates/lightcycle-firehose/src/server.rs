@@ -237,6 +237,7 @@ mod tests {
                 },
                 transactions: vec![],
             },
+            tx_infos: vec![],
         };
         let sb = StreamableBlock {
             step,
