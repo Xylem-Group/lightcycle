@@ -16,6 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use lightcycle_proto::tron::api::wallet_client::WalletClient;
 use lightcycle_proto::tron::protocol::{Block, EmptyMessage, NumberMessage};
+use lightcycle_types::{Address, SrSet};
 use tonic::transport::Channel;
 
 /// Cheap clonable handle to a connected gRPC client.
@@ -78,5 +79,41 @@ impl GrpcSource {
             .await
             .context("get_now_block rpc failed")?;
         Ok(resp.into_inner())
+    }
+
+    /// Fetch the current active SR set from the upstream node.
+    /// `Wallet.ListWitnesses` returns the full configured witness list
+    /// (active 27 + standby SRPs); we filter by the `is_jobs` flag —
+    /// java-tron sets it `true` for witnesses currently in the
+    /// block-producing rotation. This is what `verify_witness_signature`
+    /// expects.
+    ///
+    /// Refreshes are needed across maintenance-period transitions
+    /// (every 7,200 blocks ≈ 6 hours). Caller decides cadence; this
+    /// method is a single round-trip and skips any caching.
+    pub async fn fetch_active_sr_set(&mut self) -> Result<SrSet> {
+        let resp = self
+            .client
+            .list_witnesses(EmptyMessage {})
+            .await
+            .context("list_witnesses rpc failed")?
+            .into_inner();
+
+        let mut members = Vec::new();
+        for w in resp.witnesses {
+            if !w.is_jobs {
+                continue;
+            }
+            if w.address.len() != 21 {
+                anyhow::bail!(
+                    "witness address has wrong length: got {} bytes, expected 21",
+                    w.address.len()
+                );
+            }
+            let mut a = [0u8; 21];
+            a.copy_from_slice(&w.address);
+            members.push(Address(a));
+        }
+        Ok(SrSet::new(members))
     }
 }
