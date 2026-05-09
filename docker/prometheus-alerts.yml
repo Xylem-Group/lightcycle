@@ -1,0 +1,109 @@
+# Alert rules for lightcycle. Loaded via prometheus.yml's rule_files.
+#
+# Rule design: alert on user-visible SLO breach (the consistency-horizon p99)
+# AND on its load-bearing causes (solidified-head fetch failing, head gauge
+# stalled). Multiple alerts firing simultaneously help operators triangulate
+# whether the breach is an internal lightcycle issue or a chain-side one
+# without paging twice.
+
+groups:
+  - name: lightcycle.consistency-horizon
+    interval: 30s
+    rules:
+      # The headline SLO from ADR-0021 §4.
+      #
+      # Target: p99 ≤ 5s under healthy operation.
+      # Alert:  p99 > 5s sustained for > 5 min.
+      #
+      # The 5-minute "for:" window is what makes this an SLO alert and not
+      # a noise alert — TRON's block cadence is 3s and finality is ~57s
+      # (19/27 SRs at one block each), so a single slow finalization can
+      # transiently push p99 high. Sustained breach is the meaningful signal.
+      - alert: ConsistencyHorizonP99Breached
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(lightcycle_store_block_seen_to_finalized_seconds_bucket[5m]))
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+          adr: ADR-0021
+          slo: consistency-horizon
+        annotations:
+          summary: "lightcycle p99 seen→finalized > 5s for >5min"
+          description: |
+            ADR-0021 SLO breach: p99 of block_seen_to_finalized_seconds has
+            exceeded 5s for more than 5 minutes. The chain's solidified head
+            is advancing slower than it should, or lightcycle's view of it
+            is stale. Likely upstream causes already alerting:
+              - SolidifiedHeadFetchFailing: WalletSolidity.GetNowBlock errors.
+              - SolidifiedHeadStalled: gauge not advancing.
+            If neither fires, the chain itself is producing finality slowly
+            (network-wide degradation) and lightcycle is healthy.
+          runbook: "https://github.com/Xylem-Group/lightcycle/blob/main/ARCHITECTURE.md#finality-discipline-adr-0021"
+
+      # The chain-finality oracle is WalletSolidity.GetNowBlock. If the
+      # source can't fetch it, lightcycle can never advance any block to
+      # tier=Finalized, which guarantees the SLO will breach in 5+ minutes.
+      # Alerting on the fetch error rate at 1m gives operators a head start
+      # before the SLO alert fires.
+      - alert: SolidifiedHeadFetchFailing
+        expr: |
+          rate(lightcycle_relay_solidified_head_fetch_total{result="error"}[1m])
+            / ignoring(result) rate(lightcycle_relay_solidified_head_fetch_total[1m])
+            > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          adr: ADR-0021
+        annotations:
+          summary: "lightcycle solidified-head fetch failing >50% over 2min"
+          description: |
+            More than half of WalletSolidity.GetNowBlock calls are returning
+            error over the last minute, sustained for 2 minutes. Without a
+            successful fetch, no block can transition to tier=Finalized. The
+            SR-set source for this RPC is configured at startup; check the
+            upstream java-tron's solidified-RPC port and reachability.
+
+      # Even if fetch is succeeding, the chain itself may have stopped
+      # advancing finality (network-wide chain stall, not a lightcycle bug).
+      # The gauge should monotonically increase under healthy operation.
+      - alert: SolidifiedHeadStalled
+        expr: |
+          (time() - timestamp(lightcycle_relay_solidified_head)) > 0
+            and changes(lightcycle_relay_solidified_head[5m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+          adr: ADR-0021
+        annotations:
+          summary: "lightcycle solidified head has not advanced in >10min"
+          description: |
+            lightcycle_relay_solidified_head has shown the same value for
+            10 minutes. Either the chain has stopped finalizing (network-
+            wide problem, lightcycle is correctly not making things up) or
+            our fetch is reading a stale answer. Cross-check against
+            tronscan.org/#/block to confirm the chain itself is still
+            producing finality.
+
+      # The horizon observer is bounded; if max_pending evictions are
+      # firing, blocks are being seen but never finalized. That's normal
+      # for orphans (single-block reorgs) but a sustained nonzero rate
+      # means the solidified head can't keep up — usually correlated with
+      # SolidifiedHeadStalled, but worth its own signal.
+      - alert: ConsistencyHorizonEvictionsHigh
+        expr: |
+          rate(lightcycle_store_horizon_evictions_total{reason="max_pending"}[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: info
+          adr: ADR-0021
+        annotations:
+          summary: "lightcycle horizon observer evicting >0.1 entries/sec"
+          description: |
+            The seen→finalized observer is hitting max_pending and dropping
+            tracked entries. Seen blocks aren't reaching finalization fast
+            enough. Usually accompanies SolidifiedHeadStalled or a chain-
+            wide finality slowdown. Bumping max_pending masks the symptom;
+            fix the upstream cause first.
