@@ -71,6 +71,14 @@ message Block {
   // Transactions in the order java-tron included them in the block.
   // Empty for empty blocks.
   repeated Transaction transactions = 6;
+
+  // Per-block finality envelope. Sourced from the engine's view of
+  // the chain's solidified head (`WalletSolidity.GetNowBlock`) at
+  // emission time. ADR-0021 §1: every record emitted carries its
+  // finality tier as a tagged enum; this is the wire representation.
+  // Consumers that need only "safe to use as a cross-replica truth"
+  // filter on `finality.tier == FINALITY_TIER_FINALIZED`.
+  Finality finality = 7;
 }
 
 // Block header fields that aren't already carried verbatim on the
@@ -303,6 +311,52 @@ message InternalTx {
 message CallValue {
   int64 call_value = 1;
   string token_id = 2;
+}
+
+// Per-block finality envelope. Pairs the derived tier with the chain's
+// last-known solidified-head reference so consumers can both filter by
+// tier and audit the chain claim that produced the tag.
+//
+// ADR-0021 §1 + §2: this is the only legal consistency source for
+// cross-replica or cross-region agreement in lightcycle. Custom
+// quorum / Raft / Paxos shims are explicitly NOT a substitute (the
+// chain's SR consensus already solves the verification problem).
+message Finality {
+  FinalityTier tier = 1;
+
+  // Chain-reported solidified-head height at the time this record was
+  // emitted. 0 (== unset) when the engine has not yet seen a
+  // successful `WalletSolidity.GetNowBlock` response (cold start, or
+  // an upstream-RPC failure regime). When 0, `tier` is at most
+  // CONFIRMED — never FINALIZED.
+  uint64 solidified_head_number = 2;
+}
+
+// Per-block finality state. Maps 1:1 to `lightcycle_types::FinalityTier`.
+//
+// Tier transitions are monotone in (block_height, solidified_head):
+// SEEN → CONFIRMED → FINALIZED, never backward. A FINALIZED block is
+// past reorg risk per the chain's own consensus.
+enum FinalityTier {
+  // Unset / unknown. Should not appear on a wire emission; consumers
+  // treat as "trust nothing" if they see one.
+  FINALITY_TIER_UNSPECIFIED = 0;
+
+  // Block has been received and parsed; no chain-finality claim yet.
+  // Reorg risk is the highest at this tier — consumers caching state
+  // built from a SEEN block must be prepared to roll it back on UNDO.
+  FINALITY_TIER_SEEN = 1;
+
+  // Block has been built upon by ≥1 subsequent block in the engine's
+  // canonical buffer. A consensus checkpoint, but still reorg-risk-
+  // bearing until FINALIZED.
+  FINALITY_TIER_CONFIRMED = 2;
+
+  // Block height ≤ the chain's solidified-head height as last reported
+  // by `WalletSolidity.GetNowBlock`. The only tier safe to use as a
+  // consistency source for cross-replica or cross-region agreement
+  // (ADR-0021 §2).
+  FINALITY_TIER_FINALIZED = 3;
 }
 
 // Resource accounting for a tx's execution. Mirrors java-tron's

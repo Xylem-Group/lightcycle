@@ -17,7 +17,7 @@ use lightcycle_proto::firehose::v2::{
 };
 use lightcycle_proto::sf::tron::type_v1 as tron_v1;
 use lightcycle_relayer::{BufferedBlock, Cursor, Output, StreamableBlock};
-use lightcycle_types::{Address, BlockId, Step};
+use lightcycle_types::{Address, BlockFinality, BlockId, FinalityTier, Step};
 use prost::Message;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
@@ -48,6 +48,10 @@ fn synth_output(step: Step, height: u64) -> Output {
         step,
         cursor: Cursor::new(height, BlockId([height as u8; 32])),
         block,
+        finality: BlockFinality {
+            tier: FinalityTier::Seen,
+            solidified_head: None,
+        },
     };
     match step {
         Step::New => Output::New(sb),

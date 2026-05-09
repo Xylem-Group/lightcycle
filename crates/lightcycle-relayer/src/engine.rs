@@ -29,7 +29,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use lightcycle_codec::{DecodedBlock, DecodedTxInfo};
-use lightcycle_types::{BlockHeight, BlockId, Step};
+use lightcycle_types::{BlockFinality, BlockHeight, BlockId, FinalityTier, Step};
 use thiserror::Error;
 
 use crate::cursor::Cursor;
@@ -71,30 +71,73 @@ pub enum Output {
     /// Previously-emitted block is being orphaned — consumers must
     /// roll back its effects before applying the subsequent `New`(s).
     Undo(StreamableBlock),
-    /// Block has crossed the finality threshold; consumers can prune
-    /// any reorg-undo state for it.
+    /// Block has crossed the chain's solidified-head threshold (per
+    /// [`BlockFinality::tier`] = [`FinalityTier::Finalized`]).
+    /// Consumers can prune any reorg-undo state for it.
     Irreversible(StreamableBlock),
+    /// A reorg was observed at this height — the engine performed an
+    /// optimistic switch (Undo of `orphaned_tips`, New of `kept_tip`)
+    /// in the same `accept` call. This variant is the *audit ledger
+    /// entry* for the observation: the engine does not "decide" which
+    /// fork is canonical, it records that a competing tip was seen
+    /// and that the upstream peer's view drove the optimistic switch.
+    /// The chain's solidified head will later finalize one of the two
+    /// — surfaced as [`Output::ForkResolved`].
+    ///
+    /// Implements ADR-0021 §3 ("tag both, wait, log") in the engine.
+    ForkObserved {
+        observed_at_height: BlockHeight,
+        kept_tip: BlockId,
+        orphaned_tips: Vec<BlockId>,
+    },
+    /// The chain's solidified head has advanced past a previously
+    /// `ForkObserved` height; this is the chain's resolution of the
+    /// fork. We log which tip ended up on the finalized chain (the
+    /// one whose ancestry includes the solidified head). Together
+    /// with `ForkObserved` this constitutes the structured ledger of
+    /// fork events that ADR-0021 §3 mandates.
+    ForkResolved {
+        observed_at_height: BlockHeight,
+        finalized_head: BlockHeight,
+        finalized_tip: BlockId,
+        orphaned_tips: Vec<BlockId>,
+    },
 }
 
 /// The unit emitted to consumers. Pairs the decoded block with the
-/// step semantics and the resumption cursor.
+/// step semantics, the resumption cursor, and the chain-reported
+/// finality envelope. Per ADR-0021 §1, every record emitted from
+/// `lightcycle-firehose` carries its finality tier as a tagged enum.
 #[derive(Debug, Clone)]
 pub struct StreamableBlock {
     pub step: Step,
     pub block: BufferedBlock,
     pub cursor: Cursor,
+    pub finality: BlockFinality,
 }
 
 /// Engine configuration. Defaults are TRON-tuned: 30-block buffer
-/// covers any plausible reorg depth, 19-block finality matches
-/// TRON's solidified-head rule (~57s at 3s blocks).
+/// covers any plausible reorg depth.
+///
+/// **Finality is NOT computed here** — it's read from the chain via
+/// [`ReorgEngine::set_solidified_head`] (sourced from
+/// `WalletSolidity.GetNowBlock`). Per ADR-0021's "the chain has a
+/// finality machine; lean on it" discipline. `buffer_window` is now
+/// purely a reorg-resistance parameter: how far back the engine can
+/// undo without hitting `ParentNotInBuffer`. `finality_depth` is kept
+/// as the *minimum buffer width* so the buffer always retains enough
+/// history to cover plausible reorg depth, but it does NOT trigger
+/// `Irreversible` emission — only the chain-reported solidified head
+/// does that.
 #[derive(Debug, Clone, Copy)]
 pub struct ReorgConfig {
     /// How many canonical blocks to keep in memory. Must be > finality_depth
-    /// so finality emission has the buffered block on hand.
+    /// so reorg-resistance is preserved during steady state.
     pub buffer_window: usize,
-    /// Number of confirmations a block needs before it's emitted as
-    /// `Irreversible`. TRON solidifies at ~19/27 SR confirmations.
+    /// Minimum buffer depth before pruning kicks in. Originally a
+    /// confirmation-count finality trigger; now a buffer-sizing
+    /// constraint only. Kept around because removing it changes the
+    /// buffer's pruning guarantee subtly.
     pub finality_depth: usize,
 }
 
@@ -105,6 +148,17 @@ impl Default for ReorgConfig {
             finality_depth: 19,
         }
     }
+}
+
+/// Internal record of a reorg observation. Held in the engine's
+/// fork-history ring until the chain's solidified head advances past
+/// `observed_at_height`, at which point the engine emits
+/// `Output::ForkResolved` and drops it.
+#[derive(Debug, Clone)]
+struct ForkObservation {
+    observed_at_height: BlockHeight,
+    kept_tip: BlockId,
+    orphaned_tips: Vec<BlockId>,
 }
 
 /// Errors the engine surfaces when a block can't be incorporated.
@@ -156,6 +210,18 @@ pub struct ReorgEngine {
     /// used to guard `Irreversible` emission from re-firing on the
     /// same block.
     last_irreversible_height: Option<BlockHeight>,
+    /// Latest chain-reported solidified-head height, sourced from
+    /// `WalletSolidity.GetNowBlock` via the service. The engine never
+    /// recomputes finality; this is the only finality oracle.
+    /// `None` until the first successful fetch.
+    solidified_head: Option<BlockHeight>,
+    /// Pending reorg observations awaiting resolution by the chain's
+    /// solidified head. When `solidified_head` advances past an entry's
+    /// `observed_at_height`, the engine emits `Output::ForkResolved`
+    /// and drops the entry. Bounded by buffer_window + a small slack
+    /// — observations older than the buffer can no longer be resolved
+    /// against canonical state and are dropped silently.
+    fork_history: VecDeque<ForkObservation>,
     /// Counter for fork_id on `BufferedBlock`. Bumped each time we
     /// replace a block at the same height via reorg, so two cursors
     /// at the same (height, block_id) but across different reorg
@@ -176,6 +242,8 @@ impl ReorgEngine {
             canonical_ids: HashSet::with_capacity(config.buffer_window + 1),
             config,
             last_irreversible_height: None,
+            solidified_head: None,
+            fork_history: VecDeque::new(),
             next_fork_id: 0,
         }
     }
@@ -183,6 +251,37 @@ impl ReorgEngine {
     /// Current canonical tip, or None on a fresh engine.
     pub fn tip(&self) -> Option<&BufferedBlock> {
         self.canonical.back()
+    }
+
+    /// Update the chain-reported solidified head. Called by the
+    /// service after every successful `WalletSolidity.GetNowBlock`
+    /// fetch. The engine uses this to derive finality on emission and
+    /// to gate `Irreversible` / `ForkResolved` outputs.
+    ///
+    /// Returns the outputs (if any) triggered by the head advancing —
+    /// freshly-finalized buffered blocks emit as `Irreversible`, and
+    /// pending fork observations whose `observed_at_height` is now
+    /// at-or-below the new head emit as `ForkResolved`. Caller forwards
+    /// these on the same channel as `accept`'s outputs.
+    ///
+    /// Idempotent for a head that hasn't advanced. Treats a regression
+    /// (`new_head < self.solidified_head`) as a chain-level oddity and
+    /// ignores it (does not regress local state).
+    pub fn set_solidified_head(&mut self, new_head: BlockHeight) -> Vec<Output> {
+        match self.solidified_head {
+            Some(prev) if new_head <= prev => return Vec::new(),
+            _ => self.solidified_head = Some(new_head),
+        }
+        let mut out = Vec::new();
+        self.maybe_emit_irreversible(&mut out);
+        self.maybe_resolve_forks(&mut out);
+        out
+    }
+
+    /// Read the current chain-reported solidified head, if any. Test
+    /// + diagnostic surface.
+    pub fn solidified_head(&self) -> Option<BlockHeight> {
+        self.solidified_head
     }
 
     /// The number of canonical blocks currently buffered. Bounded by
@@ -259,14 +358,17 @@ impl ReorgEngine {
         };
         self.canonical_ids.insert(buffered.block_id);
         let cursor = Cursor::new(buffered.height, buffered.block_id);
+        let finality = self.derive_finality_for_tip(buffered.height);
         self.canonical.push_back(buffered.clone());
         let new = StreamableBlock {
             step: Step::New,
             block: buffered,
             cursor,
+            finality,
         };
         let mut out = vec![Output::New(new)];
         self.maybe_emit_irreversible(&mut out);
+        self.maybe_resolve_forks(&mut out);
         self.maybe_prune_buffer();
         out
     }
@@ -286,15 +388,24 @@ impl ReorgEngine {
         };
         self.canonical_ids.insert(buffered.block_id);
         let cursor = Cursor::new(buffered.height, buffered.block_id);
+        let finality = self.derive_finality_for_tip(buffered.height);
         self.canonical.push_back(buffered.clone());
         let mut out = vec![Output::New(StreamableBlock {
             step: Step::New,
             block: buffered,
             cursor,
+            finality,
         })];
         self.maybe_emit_irreversible(&mut out);
+        self.maybe_resolve_forks(&mut out);
         self.maybe_prune_buffer();
         out
+    }
+
+    /// Build the finality envelope for a block being emitted at the
+    /// canonical tip — by definition no buffered descendant.
+    fn derive_finality_for_tip(&self, height: BlockHeight) -> BlockFinality {
+        BlockFinality::for_block(height, self.solidified_head, false)
     }
 
     fn handle_reorg(
@@ -333,16 +444,24 @@ impl ReorgEngine {
 
         // Emit UNDO for each orphaned block, tip-first (reverse order
         // of original NEW emission). Build the outputs first so we
-        // can mutate canonical after.
-        let mut out = Vec::with_capacity(undo_count + 1);
+        // can mutate canonical after. Also record the orphaned ids so
+        // we can attach them to the ForkObserved ledger entry below.
+        let mut out = Vec::with_capacity(undo_count + 2);
+        let mut orphaned_tips: Vec<BlockId> = Vec::with_capacity(undo_count);
         for orphan_idx in (ancestor_idx + 1..self.canonical.len()).rev() {
             let orphan = &self.canonical[orphan_idx];
             let cursor = Cursor::new(orphan.height, orphan.block_id);
+            // Orphans carry `Seen` finality: by construction they're
+            // above the solidified head (we refused this reorg
+            // otherwise) AND no longer have a canonical descendant.
+            let finality = BlockFinality::for_block(orphan.height, self.solidified_head, false);
             out.push(Output::Undo(StreamableBlock {
                 step: Step::Undo,
                 block: orphan.clone(),
                 cursor,
+                finality,
             }));
+            orphaned_tips.push(orphan.block_id);
         }
 
         // Drop orphans from canonical state.
@@ -364,44 +483,100 @@ impl ReorgEngine {
         };
         self.canonical_ids.insert(buffered.block_id);
         let cursor = Cursor::new(buffered.height, buffered.block_id);
+        let finality = self.derive_finality_for_tip(buffered.height);
+        let kept_tip_id = buffered.block_id;
+        let observed_at_height = buffered.height;
         self.canonical.push_back(buffered.clone());
         out.push(Output::New(StreamableBlock {
             step: Step::New,
             block: buffered,
             cursor,
+            finality,
         }));
 
+        // Record the fork observation. ADR-0021 §3: we don't decide
+        // which fork wins, we record that we saw a competing tip, did
+        // an optimistic switch, and are now waiting for the chain's
+        // solidified head to confirm the resolution. ForkResolved
+        // fires when set_solidified_head crosses observed_at_height.
+        out.push(Output::ForkObserved {
+            observed_at_height,
+            kept_tip: kept_tip_id,
+            orphaned_tips: orphaned_tips.clone(),
+        });
+        self.fork_history.push_back(ForkObservation {
+            observed_at_height,
+            kept_tip: kept_tip_id,
+            orphaned_tips,
+        });
+
         self.maybe_emit_irreversible(&mut out);
+        self.maybe_resolve_forks(&mut out);
         self.maybe_prune_buffer();
         Ok(out)
     }
 
     fn maybe_emit_irreversible(&mut self, out: &mut Vec<Output>) {
-        // The block at canonical[len - 1 - finality_depth] has crossed.
-        // If it's already been emitted as Irreversible, skip.
-        let len = self.canonical.len();
-        if len <= self.config.finality_depth {
+        // ADR-0021 §1: finality is read from the chain, never computed.
+        // We emit `Irreversible` only when the chain-reported solidified
+        // head reaches a buffered block. No solidified head ⇒ no
+        // finality claim ⇒ no Irreversible.
+        let Some(solidified_head) = self.solidified_head else {
             return;
-        }
-        let crossed_idx = len - 1 - self.config.finality_depth;
-        let crossed = &self.canonical[crossed_idx];
+        };
 
-        // Don't re-emit. last_irreversible_height tracks the highest
-        // we've fired for; only fire when the crossed block's height
-        // is strictly higher.
-        if let Some(prev) = self.last_irreversible_height {
-            if crossed.height <= prev {
-                return;
+        // Walk the buffer front-to-back, emitting Irreversible for any
+        // block that is at-or-below the solidified head and whose height
+        // is strictly greater than what we've already fired for. Most
+        // ticks fire 0 or 1; this handles the rare burst case where the
+        // solidified-head fetch had been failing and just resumed.
+        for block in &self.canonical {
+            if block.height > solidified_head {
+                break;
             }
+            if let Some(prev) = self.last_irreversible_height {
+                if block.height <= prev {
+                    continue;
+                }
+            }
+            self.last_irreversible_height = Some(block.height);
+            let cursor = Cursor::new(block.height, block.block_id);
+            // Finality is by definition Finalized when we emit
+            // Irreversible — schema-enforce per ADR-0015.
+            let finality = BlockFinality {
+                tier: FinalityTier::Finalized,
+                solidified_head: Some(solidified_head),
+            };
+            out.push(Output::Irreversible(StreamableBlock {
+                step: Step::Irreversible,
+                block: block.clone(),
+                cursor,
+                finality,
+            }));
         }
-        self.last_irreversible_height = Some(crossed.height);
+    }
 
-        let cursor = Cursor::new(crossed.height, crossed.block_id);
-        out.push(Output::Irreversible(StreamableBlock {
-            step: Step::Irreversible,
-            block: crossed.clone(),
-            cursor,
-        }));
+    /// Drain pending fork observations whose `observed_at_height` is
+    /// at-or-below the chain's solidified head, emitting one
+    /// `ForkResolved` ledger entry per observation. The chain has
+    /// resolved which tip survives — we just record it; we don't
+    /// decide.
+    fn maybe_resolve_forks(&mut self, out: &mut Vec<Output>) {
+        let Some(solidified_head) = self.solidified_head else {
+            return;
+        };
+        while let Some(front) = self.fork_history.front() {
+            if front.observed_at_height > solidified_head {
+                break;
+            }
+            let obs = self.fork_history.pop_front().expect("front existed");
+            out.push(Output::ForkResolved {
+                observed_at_height: obs.observed_at_height,
+                finalized_head: solidified_head,
+                finalized_tip: obs.kept_tip,
+                orphaned_tips: obs.orphaned_tips,
+            });
+        }
     }
 
     fn maybe_prune_buffer(&mut self) {
@@ -484,10 +659,10 @@ mod tests {
     }
 
     #[test]
-    fn finality_emits_at_correct_depth() {
-        // finality_depth = 3 means: after we've buffered 4 blocks,
-        // the oldest (the one that's now 3-confirmations-deep) should
-        // be emitted as Irreversible.
+    fn finality_emits_only_when_chain_solidifies() {
+        // ADR-0021 invariant: Irreversible fires only when the
+        // chain-reported solidified head reaches a buffered block.
+        // Without a head, no Irreversible at all.
         let mut e = small_engine();
         let mut prev = id(99, 0);
         let mut all_outputs = Vec::new();
@@ -496,14 +671,6 @@ mod tests {
             all_outputs.extend(accept(&mut e, b).expect("accept"));
             prev = id(h, 0xa);
         }
-        // Expected: NEW(100), NEW(101), NEW(102), NEW(103) + IRREVERSIBLE(100).
-        let news: Vec<_> = all_outputs
-            .iter()
-            .filter_map(|o| match o {
-                Output::New(s) => Some(s.block.height),
-                _ => None,
-            })
-            .collect();
         let irrev: Vec<_> = all_outputs
             .iter()
             .filter_map(|o| match o {
@@ -511,31 +678,76 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(news, vec![100, 101, 102, 103]);
-        assert_eq!(irrev, vec![100]);
-    }
+        assert!(
+            irrev.is_empty(),
+            "no Irreversible should fire without a solidified head, got {irrev:?}"
+        );
 
-    #[test]
-    fn finality_doesnt_re_emit() {
-        // After 5 blocks with depth 3, we've emitted IRREVERSIBLE for
-        // 100 and 101. Adding a 6th should fire only for 102, not
-        // re-fire for the older ones.
-        let mut e = small_engine();
-        let mut prev = id(99, 0);
-        let mut buf = Vec::new();
-        for h in 100..106 {
-            let b = synth_block(h, id(h, 0xa), prev);
-            buf.extend(accept(&mut e, b).expect("accept"));
-            prev = id(h, 0xa);
-        }
-        let irrev_heights: Vec<_> = buf
+        // Chain reports head at 101; we should fire for 100 + 101 only.
+        let head_outs = e.set_solidified_head(101);
+        let irrev: Vec<_> = head_outs
             .iter()
             .filter_map(|o| match o {
                 Output::Irreversible(s) => Some(s.block.height),
                 _ => None,
             })
             .collect();
-        assert_eq!(irrev_heights, vec![100, 101, 102]);
+        assert_eq!(irrev, vec![100, 101]);
+    }
+
+    #[test]
+    fn finality_doesnt_re_emit_on_repeated_head_set() {
+        // set_solidified_head with the same head twice should be a no-op.
+        let mut e = small_engine();
+        let mut prev = id(99, 0);
+        // Stay within buffer_window=5 so all blocks remain available
+        // for finality emission.
+        for h in 100..103 {
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).expect("accept");
+            prev = id(h, 0xa);
+        }
+        let first = e.set_solidified_head(102);
+        let second = e.set_solidified_head(102);
+        let first_irrev: Vec<_> = first
+            .iter()
+            .filter_map(|o| match o {
+                Output::Irreversible(s) => Some(s.block.height),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first_irrev, vec![100, 101, 102]);
+        assert!(second.is_empty(), "repeated head set should be a no-op");
+    }
+
+    #[test]
+    fn finality_advancing_head_emits_in_order() {
+        // Bursting: head was unavailable for several blocks then jumps.
+        let mut e = small_engine();
+        let mut prev = id(99, 0);
+        for h in 100..105 {
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).expect("accept");
+            prev = id(h, 0xa);
+        }
+        // First, head jumps to 102 — fires for 100, 101, 102.
+        let outs = e.set_solidified_head(102);
+        let h: Vec<_> = outs
+            .iter()
+            .filter_map(|o| match o {
+                Output::Irreversible(s) => Some(s.block.height),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(h, vec![100, 101, 102]);
+        // Then advances to 104 — fires for 103, 104 only.
+        let outs = e.set_solidified_head(104);
+        let h: Vec<_> = outs
+            .iter()
+            .filter_map(|o| match o {
+                Output::Irreversible(s) => Some(s.block.height),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(h, vec![103, 104]);
     }
 
     #[test]
@@ -547,11 +759,16 @@ mod tests {
             accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
-        // Now arrive a sibling 102b, parent = 101a. Should UNDO 102a + NEW 102b.
+        // Now arrive a sibling 102b, parent = 101a. Should UNDO 102a +
+        // NEW 102b + ForkObserved (the audit ledger entry).
         let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
             .expect("accept reorg");
-        assert_eq!(outs.len(), 2);
-        match (&outs[0], &outs[1]) {
+        let undo_new: Vec<_> = outs
+            .iter()
+            .filter(|o| matches!(o, Output::Undo(_) | Output::New(_)))
+            .collect();
+        assert_eq!(undo_new.len(), 2);
+        match (&undo_new[0], &undo_new[1]) {
             (Output::Undo(u), Output::New(n)) => {
                 assert_eq!(u.block.height, 102);
                 assert_eq!(u.block.block_id.0, id(102, 0xa));
@@ -578,10 +795,13 @@ mod tests {
             .expect("accept");
         let kinds: Vec<_> = outs
             .iter()
-            .map(|o| match o {
-                Output::Undo(s) => ("undo", s.block.height),
-                Output::New(s) => ("new", s.block.height),
-                Output::Irreversible(s) => ("irrev", s.block.height),
+            .filter_map(|o| match o {
+                Output::Undo(s) => Some(("undo", s.block.height)),
+                Output::New(s) => Some(("new", s.block.height)),
+                Output::Irreversible(s) => Some(("irrev", s.block.height)),
+                // ForkObserved / ForkResolved are ledger entries — not
+                // ordered with Undo/New, so this assertion ignores them.
+                Output::ForkObserved { .. } | Output::ForkResolved { .. } => None,
             })
             .collect();
         assert_eq!(
@@ -592,22 +812,19 @@ mod tests {
 
     #[test]
     fn reorg_below_finality_is_rejected() {
-        // window=5, finality=3. After delivering 100..106 inclusive
-        // (7 blocks): the oldest block 100 has been pruned out of
-        // canonical (too old), and IRREVERSIBLE has fired up through
-        // height 103. Canonical state: [101, 102, 103, 104, 105, 106]
-        // wait — that's 6 entries. Let me trace this in the test
-        // setup loop: by accept(106) we've called maybe_prune twice
-        // so canonical = [102..106] = 5 entries. last_irrev = 103.
+        // Now finality is chain-driven: we explicitly mark heights
+        // as finalized via set_solidified_head, then refuse a reorg
+        // that would orphan a finalized block.
         let mut e = small_engine();
         let mut prev = id(99, 0);
         for h in 100..107 {
             accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
             prev = id(h, 0xa);
         }
-        // Now try to fork at 102a — its child 103a is below finality.
-        // canonical_ids contains 102a; the reorg path runs but the
-        // earliest-orphan check fires.
+        // Chain solidifies through height 103. last_irreversible_height
+        // becomes 103, so any reorg whose orphan tail reaches 103 or
+        // below is refused.
+        let _ = e.set_solidified_head(103);
         let err = accept(&mut e, synth_block(103, id(103, 0xb), id(102, 0xa)))
             .unwrap_err();
         assert!(
@@ -703,6 +920,135 @@ mod tests {
             })
             .unwrap();
         assert_ne!(new_b_fork_id, undo_a_fork_id);
+    }
+
+    #[test]
+    fn new_block_carries_finality_envelope() {
+        // ADR-0021 §1: every emitted record carries a tagged finality
+        // tier. Before any solidified head is set, tier is Seen and
+        // solidified_head is None.
+        let mut e = small_engine();
+        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0)))
+            .expect("accept");
+        match &outs[0] {
+            Output::New(s) => {
+                assert_eq!(s.finality.tier, FinalityTier::Seen);
+                assert_eq!(s.finality.solidified_head, None);
+            }
+            _ => panic!("expected New"),
+        }
+    }
+
+    #[test]
+    fn finality_envelope_uses_chain_head_when_set() {
+        let mut e = small_engine();
+        let _ = e.set_solidified_head(105);
+        let outs = accept(&mut e, synth_block(100, id(100, 0xa), id(99, 0)))
+            .expect("accept");
+        // 100 ≤ 105 ⇒ Finalized. Wait — actually no: the engine emits
+        // a NEW for 100, then maybe_emit_irreversible fires for 100
+        // because 100 ≤ 105. The NEW carries Finalized tier? No —
+        // derive_finality_for_tip is computed BEFORE Irreversible is
+        // emitted, but it still uses the head, so 100 ≤ 105 →
+        // Finalized. Both NEW(100) and Irreversible(100) should carry
+        // Finalized tier with head=105.
+        match &outs[0] {
+            Output::New(s) => {
+                assert_eq!(s.finality.tier, FinalityTier::Finalized);
+                assert_eq!(s.finality.solidified_head, Some(105));
+            }
+            _ => panic!("expected New"),
+        }
+        let irrev = outs
+            .iter()
+            .find_map(|o| match o {
+                Output::Irreversible(s) => Some(s),
+                _ => None,
+            })
+            .expect("Irreversible should fire");
+        assert_eq!(irrev.finality.tier, FinalityTier::Finalized);
+        assert_eq!(irrev.finality.solidified_head, Some(105));
+    }
+
+    #[test]
+    fn reorg_emits_fork_observed_ledger_entry() {
+        // ADR-0021 §3: on reorg, the engine records a ForkObserved
+        // ledger entry naming the kept tip and the orphans. The
+        // optimistic switch (Undo→New) still happens, but the entry
+        // makes the observation visible to consumers.
+        let mut e = small_engine();
+        let mut prev = id(99, 0);
+        for h in 100..103 {
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
+            prev = id(h, 0xa);
+        }
+        let outs = accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
+            .expect("accept reorg");
+        let observed = outs
+            .iter()
+            .find_map(|o| match o {
+                Output::ForkObserved {
+                    observed_at_height,
+                    kept_tip,
+                    orphaned_tips,
+                } => Some((*observed_at_height, *kept_tip, orphaned_tips.clone())),
+                _ => None,
+            })
+            .expect("ForkObserved should be emitted");
+        assert_eq!(observed.0, 102);
+        assert_eq!(observed.1.0, id(102, 0xb));
+        assert_eq!(observed.2.len(), 1);
+        assert_eq!(observed.2[0].0, id(102, 0xa));
+    }
+
+    #[test]
+    fn fork_resolves_when_chain_finalizes_past_observation() {
+        // ForkObserved at height 102; chain solidifies through 102;
+        // engine emits ForkResolved naming the kept tip.
+        let mut e = small_engine();
+        let mut prev = id(99, 0);
+        for h in 100..103 {
+            accept(&mut e, synth_block(h, id(h, 0xa), prev)).unwrap();
+            prev = id(h, 0xa);
+        }
+        accept(&mut e, synth_block(102, id(102, 0xb), id(101, 0xa)))
+            .expect("reorg");
+        // No solidified head yet → no ForkResolved.
+        // Solidified head jumps to 105 → ForkResolved fires.
+        let outs = e.set_solidified_head(105);
+        let resolved = outs
+            .iter()
+            .find_map(|o| match o {
+                Output::ForkResolved {
+                    observed_at_height,
+                    finalized_head,
+                    finalized_tip,
+                    orphaned_tips,
+                } => Some((
+                    *observed_at_height,
+                    *finalized_head,
+                    *finalized_tip,
+                    orphaned_tips.clone(),
+                )),
+                _ => None,
+            })
+            .expect("ForkResolved should fire");
+        assert_eq!(resolved.0, 102);
+        assert_eq!(resolved.1, 105);
+        assert_eq!(resolved.2.0, id(102, 0xb));
+        assert_eq!(resolved.3[0].0, id(102, 0xa));
+    }
+
+    #[test]
+    fn solidified_head_regression_is_ignored() {
+        // ADR-0021 failure-mode #4: chain reports a regressing head.
+        // Engine ignores it (no state change, no emissions) rather
+        // than corrupting last_irreversible_height.
+        let mut e = small_engine();
+        let _ = e.set_solidified_head(100);
+        let outs = e.set_solidified_head(50);
+        assert!(outs.is_empty(), "regression should produce no output");
+        assert_eq!(e.solidified_head(), Some(100));
     }
 
     #[test]

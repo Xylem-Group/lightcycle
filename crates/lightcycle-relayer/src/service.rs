@@ -58,7 +58,8 @@ use lightcycle_codec::{
     CodecError, DecodedBlock, DecodedTxInfo,
 };
 use lightcycle_source::GrpcSource;
-use lightcycle_types::SrSet;
+use lightcycle_store::ConsistencyHorizonObserver;
+use lightcycle_types::{BlockHeight, SrSet};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
@@ -98,6 +99,16 @@ pub struct FetchedBlock {
 #[async_trait]
 pub trait BlockFetcher: Send {
     async fn fetch_now_block(&mut self) -> Result<FetchedBlock>;
+
+    /// Fetch the chain's current solidified-head height. Default is
+    /// `Ok(None)` so test fetchers can opt out without overriding —
+    /// they end up with no chain-finality oracle, which is the right
+    /// "no finality available" regime per the type's docs. Production
+    /// fetcher overrides this to call
+    /// `WalletSolidity.GetNowBlock`.
+    async fn fetch_solidified_head(&mut self) -> Result<Option<BlockHeight>> {
+        Ok(None)
+    }
 }
 
 /// Production adapter: hits java-tron's `Wallet.GetNowBlock` and
@@ -133,6 +144,10 @@ impl GrpcBlockFetcher {
 
 #[async_trait]
 impl BlockFetcher for GrpcBlockFetcher {
+    async fn fetch_solidified_head(&mut self) -> Result<Option<BlockHeight>> {
+        self.source.fetch_solidified_head().await
+    }
+
     async fn fetch_now_block(&mut self) -> Result<FetchedBlock> {
         let block = self.source.fetch_now_block().await?;
         let decoded = decode_block_message(&block).context("codec decode failed")?;
@@ -214,6 +229,12 @@ pub struct RelayerService<F: BlockFetcher> {
     sr_set: watch::Receiver<Option<SrSet>>,
     verify_policy: VerifyPolicy,
     poll_interval: Duration,
+    /// SLO observer (per ADR-0021): records seen→finalized latency
+    /// into `lightcycle_store_block_seen_to_finalized_seconds`.
+    /// Lives in the service rather than the engine because the
+    /// engine is sync-pure; the observer carries `Instant` state and
+    /// the metric emit is a service-layer concern.
+    horizon: ConsistencyHorizonObserver,
 }
 
 impl<F: BlockFetcher> std::fmt::Debug for RelayerService<F> {
@@ -251,6 +272,9 @@ impl<F: BlockFetcher> RelayerService<F> {
             sr_set,
             verify_policy,
             poll_interval,
+            // 1024 covers TRON's reorg window with generous slack;
+            // sustained orphan rate would evict before this saturates.
+            horizon: ConsistencyHorizonObserver::new(1024),
         }
     }
 
@@ -295,6 +319,52 @@ impl<F: BlockFetcher> RelayerService<F> {
     }
 
     async fn tick_once(&mut self, output_tx: &mpsc::Sender<Output>) -> Result<(), ServiceError> {
+        // Refresh the chain-reported solidified head per ADR-0021's
+        // "the chain has a finality machine; lean on it" — soft-fail
+        // on RPC error so a transient solidity-RPC blip doesn't halt
+        // the live stream. Counted via
+        // `lightcycle_relay_solidified_head_fetch_total`. Any
+        // Irreversible / ForkResolved outputs the head advance triggers
+        // are forwarded on the same channel as block emissions.
+        match self.fetcher.fetch_solidified_head().await {
+            Ok(Some(h)) => {
+                metrics::counter!(
+                    "lightcycle_relay_solidified_head_fetch_total",
+                    "result" => "ok"
+                )
+                .increment(1);
+                metrics::gauge!("lightcycle_relay_solidified_head").set(h as f64);
+                let outs = self.engine.set_solidified_head(h);
+                for output in outs {
+                    log_output(&output);
+                    self.observe_for_horizon(&output);
+                    metrics::counter!(
+                        "lightcycle_relay_outputs_total",
+                        "step" => step_label(&output)
+                    )
+                    .increment(1);
+                    if output_tx.send(output).await.is_err() {
+                        return Err(ServiceError::OutputChannelClosed);
+                    }
+                }
+            }
+            Ok(None) => {
+                metrics::counter!(
+                    "lightcycle_relay_solidified_head_fetch_total",
+                    "result" => "empty"
+                )
+                .increment(1);
+            }
+            Err(e) => {
+                warn!(error = %e, "solidified-head RPC failed; finality emission paused this tick");
+                metrics::counter!(
+                    "lightcycle_relay_solidified_head_fetch_total",
+                    "result" => "rpc_error"
+                )
+                .increment(1);
+            }
+        }
+
         let fetched = self
             .fetcher
             .fetch_now_block()
@@ -396,6 +466,7 @@ impl<F: BlockFetcher> RelayerService<F> {
             Ok(outputs) => {
                 for output in outputs {
                     log_output(&output);
+                    self.observe_for_horizon(&output);
                     metrics::counter!(
                         "lightcycle_relay_outputs_total",
                         "step" => step_label(&output)
@@ -456,6 +527,28 @@ impl<F: BlockFetcher> RelayerService<F> {
     pub fn tip_height(&self) -> Option<lightcycle_types::BlockHeight> {
         self.engine.tip().map(|t| t.height)
     }
+
+    /// Feed the consistency-horizon observer (ADR-0021 SLO). Called
+    /// for every output before it ships; records seen→finalized
+    /// latency into
+    /// `lightcycle_store_block_seen_to_finalized_seconds`.
+    /// Pass-through for variants that don't have a single block id
+    /// (ledger entries) or aren't tier transitions (Undo).
+    fn observe_for_horizon(&mut self, output: &Output) {
+        match output {
+            Output::New(s) => {
+                self.horizon.observe_seen(s.block.block_id, s.block.height);
+            }
+            Output::Irreversible(s) => {
+                self.horizon.observe_finalized(s.block.block_id);
+            }
+            // Undo: orphaned block won't reach Finalized via this id;
+            // observer eviction (max_pending) cleans it up eventually.
+            // ForkObserved / ForkResolved: ledger-only, no per-id
+            // tier transition to record.
+            Output::Undo(_) | Output::ForkObserved { .. } | Output::ForkResolved { .. } => {}
+        }
+    }
 }
 
 fn step_label(o: &Output) -> &'static str {
@@ -463,6 +556,8 @@ fn step_label(o: &Output) -> &'static str {
         Output::New(_) => "new",
         Output::Undo(_) => "undo",
         Output::Irreversible(_) => "irreversible",
+        Output::ForkObserved { .. } => "fork_observed",
+        Output::ForkResolved { .. } => "fork_resolved",
     }
 }
 
@@ -473,19 +568,47 @@ fn log_output(o: &Output) {
             height = s.block.height,
             block_id = %hex::encode(s.block.block_id.0),
             tx_count = s.block.decoded.transactions.len(),
+            tier = ?s.finality.tier,
+            solidified_head = s.finality.solidified_head,
             "block emitted"
         ),
         Output::Undo(s) => warn!(
             step = "UNDO",
             height = s.block.height,
             block_id = %hex::encode(s.block.block_id.0),
+            tier = ?s.finality.tier,
             "block orphaned by reorg"
         ),
         Output::Irreversible(s) => info!(
             step = "IRREVERSIBLE",
             height = s.block.height,
             block_id = %hex::encode(s.block.block_id.0),
-            "block crossed finality"
+            solidified_head = s.finality.solidified_head,
+            "block crossed finality (chain-reported)"
+        ),
+        Output::ForkObserved {
+            observed_at_height,
+            kept_tip,
+            orphaned_tips,
+        } => warn!(
+            step = "FORK_OBSERVED",
+            height = observed_at_height,
+            kept_tip = %hex::encode(kept_tip.0),
+            orphan_count = orphaned_tips.len(),
+            "fork observed; awaiting chain finality to resolve"
+        ),
+        Output::ForkResolved {
+            observed_at_height,
+            finalized_head,
+            finalized_tip,
+            orphaned_tips,
+        } => info!(
+            step = "FORK_RESOLVED",
+            observed_at_height = observed_at_height,
+            finalized_head = finalized_head,
+            finalized_tip = %hex::encode(finalized_tip.0),
+            orphan_count = orphaned_tips.len(),
+            "chain finalized past fork; resolution logged"
         ),
     }
 }
@@ -516,6 +639,14 @@ pub fn describe_metrics() {
     metrics::describe_counter!(
         "lightcycle_relay_tx_info_fetch_total",
         "tx-info side-channel fetches, labelled by result (ok|rpc_error|decode_error)"
+    );
+    metrics::describe_counter!(
+        "lightcycle_relay_solidified_head_fetch_total",
+        "solidified-head fetches from WalletSolidity.GetNowBlock, by result (ok|empty|rpc_error)"
+    );
+    metrics::describe_gauge!(
+        "lightcycle_relay_solidified_head",
+        "chain-reported solidified-head block number (per ADR-0021 the only legal finality oracle)"
     );
 }
 
@@ -681,10 +812,13 @@ mod tests {
 
         let kinds: Vec<_> = outputs
             .iter()
-            .map(|o| match o {
-                Output::New(s) => ("new", s.block.height, s.block.block_id.0[8]),
-                Output::Undo(s) => ("undo", s.block.height, s.block.block_id.0[8]),
-                Output::Irreversible(s) => ("irrev", s.block.height, s.block.block_id.0[8]),
+            .filter_map(|o| match o {
+                Output::New(s) => Some(("new", s.block.height, s.block.block_id.0[8])),
+                Output::Undo(s) => Some(("undo", s.block.height, s.block.block_id.0[8])),
+                Output::Irreversible(s) => Some(("irrev", s.block.height, s.block.block_id.0[8])),
+                // Ledger-entry variants don't have a single block_id;
+                // they're tested separately.
+                Output::ForkObserved { .. } | Output::ForkResolved { .. } => None,
             })
             .collect();
         assert_eq!(

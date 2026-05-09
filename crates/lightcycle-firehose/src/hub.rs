@@ -92,7 +92,7 @@ mod tests {
     use super::*;
     use lightcycle_codec::{DecodedBlock, DecodedHeader};
     use lightcycle_relayer::{BufferedBlock, Cursor, StreamableBlock};
-    use lightcycle_types::{Address, BlockId, Step};
+    use lightcycle_types::{Address, BlockFinality, BlockId, FinalityTier, Step};
     use std::time::Duration;
 
     fn synth_output_new(height: u64) -> Output {
@@ -121,6 +121,10 @@ mod tests {
             step: Step::New,
             cursor: Cursor::new(height, BlockId([height as u8; 32])),
             block,
+            finality: BlockFinality {
+                tier: FinalityTier::Seen,
+                solidified_head: None,
+            },
         })
     }
 

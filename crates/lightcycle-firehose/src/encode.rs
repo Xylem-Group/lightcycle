@@ -35,11 +35,14 @@ use std::collections::HashMap;
 use lightcycle_codec::{DecodedContract, DecodedTransaction, DecodedTxInfo};
 use lightcycle_proto::sf::tron::type_v1 as pb;
 use lightcycle_relayer::BufferedBlock;
-use lightcycle_types::TxHash;
+use lightcycle_types::{BlockFinality, FinalityTier, TxHash};
 use prost_types::Timestamp;
 
-/// Encode a buffered block into `sf.tron.type.v1.Block`.
-pub fn encode_block(buffered: &BufferedBlock) -> pb::Block {
+/// Encode a buffered block + its emission-time finality envelope into
+/// `sf.tron.type.v1.Block`. The finality envelope is sourced from the
+/// engine's view of the chain's solidified head at emission time —
+/// see `lightcycle_relayer::ReorgEngine::set_solidified_head`.
+pub fn encode_block(buffered: &BufferedBlock, finality: BlockFinality) -> pb::Block {
     let header = &buffered.decoded.header;
 
     // Build a lookup keyed by tx hash so the per-tx encoder can join
@@ -70,6 +73,23 @@ pub fn encode_block(buffered: &BufferedBlock) -> pb::Block {
             .iter()
             .map(|tx| encode_transaction(tx, info_by_hash.get(&tx.hash).copied()))
             .collect(),
+        finality: Some(encode_finality(finality)),
+    }
+}
+
+fn encode_finality(f: BlockFinality) -> pb::Finality {
+    pb::Finality {
+        tier: encode_finality_tier(f.tier) as i32,
+        // 0 == unset; consumers treat 0 as "no chain claim yet".
+        solidified_head_number: f.solidified_head.unwrap_or(0),
+    }
+}
+
+fn encode_finality_tier(t: FinalityTier) -> pb::FinalityTier {
+    match t {
+        FinalityTier::Seen => pb::FinalityTier::Seen,
+        FinalityTier::Confirmed => pb::FinalityTier::Confirmed,
+        FinalityTier::Finalized => pb::FinalityTier::Finalized,
     }
 }
 
@@ -237,6 +257,16 @@ mod tests {
     use lightcycle_types::{Address, BlockId, TxHash};
     use prost::Message;
 
+    /// Tests that don't care about the finality envelope use this
+    /// default — Seen tier with no chain reference. Tests asserting on
+    /// finality build their own envelope explicitly.
+    fn default_finality() -> BlockFinality {
+        BlockFinality {
+            tier: FinalityTier::Seen,
+            solidified_head: None,
+        }
+    }
+
     fn addr(b: u8) -> Address {
         let mut a = [0u8; 21];
         a[0] = 0x41;
@@ -287,7 +317,7 @@ mod tests {
     #[test]
     fn block_top_level_fields_round_trip() {
         let buf = synth_buffered(82_500_001, vec![]);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         // Round-trip through prost so the field tags are exercised.
         let bytes = pb.encode_to_vec();
         let decoded = pb::Block::decode(bytes.as_slice()).expect("decode");
@@ -313,7 +343,7 @@ mod tests {
             amount_sun: 1_234_567,
         }];
         let buf = synth_buffered(82_500_002, contracts);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         let tx = &pb.transactions[0];
         let c = &tx.contracts[0];
         assert_eq!(c.kind, pb::ContractKind::Transfer as i32);
@@ -340,7 +370,7 @@ mod tests {
             raw: raw.clone(),
         }];
         let buf = synth_buffered(82_500_003, contracts);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         let c = &pb.transactions[0].contracts[0];
         assert_eq!(c.kind, pb::ContractKind::Other as i32);
         assert_eq!(c.unknown_kind, ContractKind::FreezeBalanceV2.to_wire_tag());
@@ -361,7 +391,7 @@ mod tests {
             raw: vec![0xff],
         }];
         let buf = synth_buffered(82_500_004, contracts);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         let c = &pb.transactions[0].contracts[0];
         assert_eq!(c.unknown_kind, 9999);
         match c.payload.as_ref().expect("payload") {
@@ -376,7 +406,7 @@ mod tests {
         // periods produce many) — encoder must handle them cleanly.
         let mut buf = synth_buffered(82_500_005, vec![]);
         buf.decoded.transactions.clear();
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         assert!(pb.transactions.is_empty());
         assert_eq!(pb.number, 82_500_005);
     }
@@ -388,7 +418,7 @@ mod tests {
         // remain None — same shape as before tx-info ingest landed,
         // so consumers don't see spurious empty-but-Some payloads.
         let buf = synth_buffered(82_500_006, vec![]);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         for tx in &pb.transactions {
             assert!(tx.info.is_none());
         }
@@ -434,7 +464,7 @@ mod tests {
             }],
         };
         let buf = synth_buffered_with_infos(82_500_010, vec![], vec![info.clone()]);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         let pb_info = pb.transactions[0].info.as_ref().expect("info populated");
         assert!(pb_info.success);
         assert_eq!(pb_info.fee_sun, 7_777_777);
@@ -467,7 +497,7 @@ mod tests {
             internal_transactions: vec![],
         };
         let buf = synth_buffered_with_infos(82_500_011, vec![], vec![mismatched_info]);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         assert!(pb.transactions[0].info.is_none());
     }
 
@@ -487,7 +517,7 @@ mod tests {
             token_id: 0,
         }];
         let buf = synth_buffered(82_500_007, contracts);
-        let pb = encode_block(&buf);
+        let pb = encode_block(&buf, default_finality());
         match pb.transactions[0].contracts[0]
             .payload
             .as_ref()

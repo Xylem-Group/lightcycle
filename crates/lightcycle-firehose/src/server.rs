@@ -110,8 +110,13 @@ impl StreamSvc for StreamService {
         // proper Stream impl that holds the recv future across polls
         // — necessary so the broadcast send wakes us on the next
         // message rather than silently dropping the waker.
-        let stream = BroadcastStream::new(rx).map(|res| match res {
-            Ok(output) => Ok(output_to_response(output)),
+        // Filter ledger-entry variants (ForkObserved / ForkResolved) at
+        // the gRPC boundary: Firehose v2's `Response` has no STATUS
+        // shape, and the audit ledger flows through tracing logs +
+        // metrics on the relayer side instead. See ARCHITECTURE.md
+        // "Finality discipline" + ADR-0021 §3.
+        let stream = BroadcastStream::new(rx).filter_map(|res| match res {
+            Ok(output) => output_to_response(output).map(Ok),
             Err(BroadcastStreamRecvError::Lagged(skipped)) => {
                 warn!(skipped, "firehose subscriber lagged");
                 metrics::counter!(
@@ -119,10 +124,10 @@ impl StreamSvc for StreamService {
                     "skipped" => skipped.to_string()
                 )
                 .increment(1);
-                Err(Status::resource_exhausted(format!(
+                Some(Err(Status::resource_exhausted(format!(
                     "subscriber lagged the firehose hub by {skipped} messages; \
                      reconnect with last cursor",
-                )))
+                ))))
             }
         });
 
@@ -130,11 +135,15 @@ impl StreamSvc for StreamService {
     }
 }
 
-fn output_to_response(output: Output) -> Response {
+fn output_to_response(output: Output) -> Option<Response> {
     let (step, sb) = match output {
         Output::New(s) => (ForkStep::StepNew, s),
         Output::Undo(s) => (ForkStep::StepUndo, s),
         Output::Irreversible(s) => (ForkStep::StepFinal, s),
+        // Ledger-entry variants don't fit Firehose v2's wire shape
+        // (no STATUS variant). They flow through tracing logs +
+        // metrics in the relayer instead.
+        Output::ForkObserved { .. } | Output::ForkResolved { .. } => return None,
     };
     let height = sb.block.height;
     let parent_height = height.saturating_sub(1);
@@ -145,27 +154,32 @@ fn output_to_response(output: Output) -> Response {
     // height through the StreamableBlock yet. Leaving 0 is honest
     // (consumers will treat as "unknown / pre-finality"); when we
     // thread the LIB through the engine output, fill it in here.
+    // lib_num: now sourced from the chain's solidified head when
+    // available (per ADR-0021 the only legal finality oracle), so
+    // consumers reading metadata.lib_num see the chain's claim, not a
+    // count we computed. Falls back to 0 only when the engine hasn't
+    // yet seen a successful WalletSolidity.GetNowBlock response.
     let metadata = BlockMetadata {
         num: height,
         id: block_id_hex,
         parent_num: parent_height,
         parent_id: parent_id_hex,
-        lib_num: 0,
+        lib_num: sb.finality.solidified_head.unwrap_or(0),
         time: Some(timestamp_from_ms(sb.block.decoded.header.timestamp_ms)),
     };
 
-    let block_pb = encode_block(&sb.block);
+    let block_pb = encode_block(&sb.block, sb.finality);
     let block_any = Any {
         type_url: BLOCK_TYPE_URL.into(),
         value: block_pb.encode_to_vec(),
     };
 
-    Response {
+    Some(Response {
         block: Some(block_any),
         step: step as i32,
         cursor: hex::encode(sb.cursor.to_bytes()),
         metadata: Some(metadata),
-    }
+    })
 }
 
 fn timestamp_from_ms(ms: i64) -> Timestamp {
@@ -215,7 +229,7 @@ mod tests {
     use super::*;
     use lightcycle_codec::{DecodedBlock, DecodedHeader};
     use lightcycle_relayer::{BufferedBlock, Cursor, StreamableBlock};
-    use lightcycle_types::{Address, BlockId, Step};
+    use lightcycle_types::{Address, BlockFinality, BlockId, FinalityTier, Step};
 
     fn synth_output(step: Step, height: u64) -> Output {
         let block = BufferedBlock {
@@ -243,6 +257,10 @@ mod tests {
             step,
             cursor: Cursor::new(height, BlockId([height as u8; 32])),
             block,
+            finality: BlockFinality {
+                tier: FinalityTier::Seen,
+                solidified_head: None,
+            },
         };
         match step {
             Step::New => Output::New(sb),
@@ -253,17 +271,17 @@ mod tests {
 
     #[test]
     fn output_to_response_maps_step_to_fork_step() {
-        let r = output_to_response(synth_output(Step::New, 100));
+        let r = output_to_response(synth_output(Step::New, 100)).expect("Some");
         assert_eq!(r.step, ForkStep::StepNew as i32);
-        let r = output_to_response(synth_output(Step::Undo, 100));
+        let r = output_to_response(synth_output(Step::Undo, 100)).expect("Some");
         assert_eq!(r.step, ForkStep::StepUndo as i32);
-        let r = output_to_response(synth_output(Step::Irreversible, 100));
+        let r = output_to_response(synth_output(Step::Irreversible, 100)).expect("Some");
         assert_eq!(r.step, ForkStep::StepFinal as i32);
     }
 
     #[test]
     fn response_metadata_carries_height_and_ids() {
-        let r = output_to_response(synth_output(Step::New, 82_531_247));
+        let r = output_to_response(synth_output(Step::New, 82_531_247)).expect("Some");
         let md = r.metadata.expect("metadata");
         assert_eq!(md.num, 82_531_247);
         assert_eq!(md.parent_num, 82_531_246);
@@ -280,7 +298,7 @@ mod tests {
 
     #[test]
     fn response_cursor_round_trips_hex() {
-        let r = output_to_response(synth_output(Step::New, 100));
+        let r = output_to_response(synth_output(Step::New, 100)).expect("Some");
         let bytes = hex::decode(&r.cursor).expect("hex");
         let parsed = Cursor::from_bytes(&bytes).expect("parse");
         assert_eq!(parsed.height, 100);
@@ -295,12 +313,81 @@ mod tests {
         use lightcycle_proto::sf::tron::type_v1 as tron_v1;
         use prost::Message;
 
-        let r = output_to_response(synth_output(Step::New, 82_500_999));
+        let r = output_to_response(synth_output(Step::New, 82_500_999)).expect("Some");
         let any = r.block.expect("block any");
         assert_eq!(any.type_url, BLOCK_TYPE_URL);
         assert!(!any.value.is_empty(), "block payload must not be empty");
         let decoded = tron_v1::Block::decode(any.value.as_slice()).expect("decode");
         assert_eq!(decoded.number, 82_500_999);
         assert!(decoded.header.is_some());
+    }
+
+    #[test]
+    fn response_block_finality_field_round_trips() {
+        // ADR-0021 §1: finality tier is on the wire on every
+        // emission. Synthesize a block whose StreamableBlock has a
+        // populated finality envelope and confirm round-trip.
+        use lightcycle_proto::sf::tron::type_v1 as tron_v1;
+        use prost::Message;
+
+        let block = BufferedBlock {
+            height: 100,
+            block_id: BlockId([100u8; 32]),
+            parent_id: BlockId([99u8; 32]),
+            fork_id: 0,
+            decoded: DecodedBlock {
+                header: DecodedHeader {
+                    height: 100,
+                    block_id: BlockId([100u8; 32]),
+                    parent_id: BlockId([99u8; 32]),
+                    raw_data_hash: [0u8; 32],
+                    tx_trie_root: [0u8; 32],
+                    timestamp_ms: 1_777_854_558_000,
+                    witness: Address([0x41; 21]),
+                    witness_signature: vec![],
+                    version: 34,
+                },
+                transactions: vec![],
+            },
+            tx_infos: vec![],
+        };
+        let sb = StreamableBlock {
+            step: Step::Irreversible,
+            cursor: Cursor::new(100, BlockId([100u8; 32])),
+            block,
+            finality: BlockFinality {
+                tier: FinalityTier::Finalized,
+                solidified_head: Some(105),
+            },
+        };
+        let resp = output_to_response(Output::Irreversible(sb)).expect("Some");
+        // metadata.lib_num is now sourced from solidified_head.
+        assert_eq!(resp.metadata.as_ref().unwrap().lib_num, 105);
+        let any = resp.block.expect("block");
+        let decoded = tron_v1::Block::decode(any.value.as_slice()).expect("decode");
+        let f = decoded.finality.expect("finality on wire");
+        assert_eq!(f.tier, tron_v1::FinalityTier::Finalized as i32);
+        assert_eq!(f.solidified_head_number, 105);
+    }
+
+    #[test]
+    fn ledger_entries_skip_grpc_response() {
+        // ForkObserved / ForkResolved have no Firehose v2 wire shape;
+        // output_to_response returns None so the gRPC stream filters
+        // them out.
+        let observed = Output::ForkObserved {
+            observed_at_height: 100,
+            kept_tip: BlockId([0xbb; 32]),
+            orphaned_tips: vec![BlockId([0xaa; 32])],
+        };
+        assert!(output_to_response(observed).is_none());
+
+        let resolved = Output::ForkResolved {
+            observed_at_height: 100,
+            finalized_head: 120,
+            finalized_tip: BlockId([0xbb; 32]),
+            orphaned_tips: vec![BlockId([0xaa; 32])],
+        };
+        assert!(output_to_response(resolved).is_none());
     }
 }
