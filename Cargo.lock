@@ -1430,6 +1430,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "hex",
  "lightcycle-codec",
  "lightcycle-source",
  "lightcycle-store",
