@@ -457,6 +457,21 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         let hub = lightcycle_firehose::Hub::new(args.firehose_hub_capacity);
         let pump_handle = hub.pump_from(output_rx);
 
+        // Build the Fetch.Block oracle. Needs its own GrpcSource
+        // connection because the relayer's source is owned by the live-
+        // tail pipeline (Fetch.Block fires on operator request, often
+        // out of phase with the tick loop). Sharing the connection
+        // would serialize Fetch behind the live-tail mutex and add
+        // latency tail at no benefit. Costs one extra gRPC channel.
+        let oracle_source =
+            lightcycle_source::GrpcSource::connect(args.grpc_url.clone())
+                .await
+                .with_context(|| {
+                    format!("gRPC connect (Fetch.Block oracle): {}", args.grpc_url)
+                })?;
+        let oracle: lightcycle_firehose::SharedBlockOracle =
+            std::sync::Arc::new(GrpcBlockOracle::new(oracle_source));
+
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let chain_name = args.firehose_chain_name.clone();
         let hub_for_serve = hub.clone();
@@ -464,6 +479,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
             if let Err(e) = lightcycle_firehose::serve(
                 listen,
                 hub_for_serve,
+                oracle,
                 chain_name,
                 async move {
                     let _ = server_shutdown_rx.await;
@@ -510,6 +526,93 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
     drop(sr_set_tx); // drop the sender so any lingering refresh recv() exits
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), service_handle).await;
     Ok(())
+}
+
+/// Backs `Fetch.Block` with a dedicated `GrpcSource` connection.
+///
+/// Each fetch performs two upstream RPCs: `Wallet.GetBlockByNum` for the
+/// block bytes, then `WalletSolidity.GetNowBlock` for a fresh solidified-
+/// head snapshot used to stamp the response's finality envelope. Two
+/// RPCs per request is intentional for v0.1: it keeps the oracle
+/// stateless (no clock drift relative to a cached head, no shared state
+/// with the relayer), at the cost of one extra round-trip per
+/// `Fetch.Block` call. Acceptable because Fetch is per-request, not
+/// per-block-tail. When `lightcycle-store` lands a block + head cache,
+/// a cached impl will land alongside this one and the CLI will compose
+/// (cache → upstream fallback) without changing the firehose surface.
+///
+/// Upstream failures are mapped to `Ok(None)` (NotFound) for cleanly-
+/// rejected fetches (block doesn't exist yet, lite-fullnode mode
+/// returning empty) and `Err(_)` for transport/decode errors. The
+/// firehose service translates these to `Status::not_found` and
+/// `Status::internal` respectively.
+struct GrpcBlockOracle {
+    source: tokio::sync::Mutex<GrpcSource>,
+}
+
+impl GrpcBlockOracle {
+    fn new(source: GrpcSource) -> Self {
+        Self {
+            source: tokio::sync::Mutex::new(source),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl lightcycle_firehose::BlockOracle for GrpcBlockOracle {
+    async fn fetch_block_by_number(
+        &self,
+        height: u64,
+    ) -> anyhow::Result<Option<(lightcycle_relayer::BufferedBlock, lightcycle_types::BlockFinality)>>
+    {
+        let mut src = self.source.lock().await;
+
+        let block_msg = match src.fetch_block(height).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Heuristic: java-tron returns an empty Block for "not yet
+                // produced" rather than a gRPC NotFound. The decoder
+                // catches that downstream — we just propagate the error
+                // and let the service map it to internal. The truly
+                // "block doesn't exist" case lands as Ok(empty block) →
+                // codec rejects → Err here. Practical effect: the client
+                // sees Status::internal with a clear message rather than
+                // Status::not_found, which is honest.
+                return Err(e.context("Fetch.Block: upstream get_block_by_num failed"));
+            }
+        };
+
+        // Empty Block (lite-fullnode mode, or the height is past head):
+        // upstream returns a Block with no header. Surface as NotFound.
+        if block_msg.block_header.is_none() {
+            return Ok(None);
+        }
+
+        let solidified_head = src.fetch_solidified_head().await.unwrap_or(None);
+        drop(src);
+
+        let decoded = lightcycle_codec::decode_block_message(&block_msg)
+            .context("Fetch.Block: decode failed")?;
+        let buffered = lightcycle_relayer::BufferedBlock {
+            height: decoded.header.height,
+            block_id: decoded.header.block_id,
+            parent_id: decoded.header.parent_id,
+            fork_id: 0,
+            decoded,
+            tx_infos: vec![],
+        };
+        // has_buffered_descendant=false: Fetch.Block has no buffer
+        // awareness. The honest answer is Seen (or Finalized if the
+        // block is at-or-below the chain's solidified head). Confirmed
+        // is reserved for blocks whose buffered-descendant state is
+        // known, which is a Stream.Blocks concern.
+        let finality = lightcycle_types::BlockFinality::for_block(
+            buffered.height,
+            solidified_head,
+            false,
+        );
+        Ok(Some((buffered, finality)))
+    }
 }
 
 async fn run_inspect(args: InspectArgs) -> Result<()> {

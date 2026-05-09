@@ -2,25 +2,32 @@
 //!
 //! Speaks `sf.firehose.v2` so Substreams (and any other Firehose
 //! consumer) can subscribe to live block streams with reorg-correct
-//! step semantics. v0.1 ships **live mode only** — backfill via cursor
-//! / start_block_num requires the [`lightcycle-store`] crate to be
-//! wired in, which is a separate piece of work.
+//! step semantics. v0.1 ships `Stream.Blocks` (live mode only),
+//! `Fetch.Block` (point-in-time by number), and `EndpointInfo.Info`.
+//! `Stream.Blocks` backfill via cursor / start_block_num requires the
+//! [`lightcycle-store`] crate to be wired in, which is a separate piece
+//! of work.
 //!
-//! Architecture in three pieces:
+//! Architecture in four pieces:
 //!
 //! - [`Hub`] multiplexes the relayer's single-consumer mpsc into a
 //!   broadcast channel that fans out to all gRPC subscribers. Slow
 //!   subscribers get `Lagged` rather than back-pressuring the engine.
-//! - [`StreamService`] / [`EndpointInfoService`] — tonic impls of
-//!   the Firehose v2 services.
+//! - [`StreamService`] / [`FetchService`] / [`EndpointInfoService`] —
+//!   tonic impls of the Firehose v2 services.
+//! - [`BlockOracle`] — abstraction Fetch.Block consumes. The CLI builds
+//!   a concrete impl over a dedicated `GrpcSource`; future
+//!   `lightcycle-store` cache impls compose without changing the
+//!   firehose surface.
 //! - [`serve`] — wires everything into a tonic server bound to an
 //!   address. The CLI's `relay --firehose-listen=...` flag is the
 //!   typical caller.
 //!
 //! Out of scope for v0.1 (intentional, documented):
-//! - `Fetch.Block` (point-in-time block lookup)
 //! - `Stream.Blocks` backfill via `cursor` or `start_block_num`
-//! - `final_blocks_only` and `transforms` request fields
+//! - `Fetch.Block` references other than `BlockNumber` (no
+//!   `BlockHashAndNumber`, no `Cursor`); no `transforms`
+//! - `final_blocks_only` and `transforms` on Stream
 //! - `TransactionInfo` side-channel join — the
 //!   [`sf.tron.type.v1.Block`] payload is fully populated for
 //!   header / transactions / contracts, but `Transaction.info`
@@ -32,17 +39,20 @@
 
 mod encode;
 mod hub;
+mod oracle;
 mod server;
 
 pub use encode::{encode_block, BLOCK_TYPE_URL};
 pub use hub::Hub;
-pub use server::{EndpointInfoService, StreamService};
+pub use oracle::{BlockOracle, SharedBlockOracle};
+pub use server::{EndpointInfoService, FetchService, StreamService};
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use lightcycle_proto::firehose::v2::{
-    endpoint_info_server::EndpointInfoServer, stream_server::StreamServer,
+    endpoint_info_server::EndpointInfoServer, fetch_server::FetchServer,
+    stream_server::StreamServer,
 };
 use tonic::transport::Server;
 use tracing::info;
@@ -50,16 +60,18 @@ use tracing::info;
 /// Run the gRPC server until the shutdown future resolves.
 ///
 /// `chain_name` is reflected in `EndpointInfo.Info` (e.g. "tron-mainnet");
-/// `hub` provides the live broadcast for `Stream.Blocks`. The future
-/// returned by `shutdown` (typically `tokio::signal::ctrl_c()`) drives
-/// graceful shutdown.
+/// `hub` provides the live broadcast for `Stream.Blocks`; `oracle` backs
+/// `Fetch.Block`. The future returned by `shutdown` (typically
+/// `tokio::signal::ctrl_c()`) drives graceful shutdown.
 pub async fn serve(
     listen: SocketAddr,
     hub: Hub,
+    oracle: SharedBlockOracle,
     chain_name: impl Into<String>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let stream_svc = StreamService::new(hub);
+    let fetch_svc = FetchService::new(oracle);
     let info_svc = EndpointInfoService::new(chain_name);
 
     info!(%listen, "firehose gRPC server starting");
@@ -67,6 +79,7 @@ pub async fn serve(
 
     Server::builder()
         .add_service(StreamServer::new(stream_svc))
+        .add_service(FetchServer::new(fetch_svc))
         .add_service(EndpointInfoServer::new(info_svc))
         .serve_with_shutdown(listen, shutdown)
         .await
@@ -98,5 +111,14 @@ pub fn describe_metrics() {
     metrics::describe_counter!(
         "lightcycle_firehose_server_starts_total",
         "firehose gRPC server start events (process restarts)"
+    );
+    metrics::describe_counter!(
+        "lightcycle_firehose_fetch_total",
+        "Fetch.Block requests, labelled by result (in_flight / ok / not_found / error)"
+    );
+    metrics::describe_histogram!(
+        "lightcycle_firehose_fetch_duration_seconds",
+        metrics::Unit::Seconds,
+        "Fetch.Block request duration. Includes upstream RPC + decode time."
     );
 }

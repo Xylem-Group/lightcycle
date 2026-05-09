@@ -20,6 +20,7 @@ lightcycle-codec.workspace = true
 lightcycle-proto.workspace = true
 prost.workspace = true
 hex.workspace = true
+async-trait.workspace = true
 
 clap.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }

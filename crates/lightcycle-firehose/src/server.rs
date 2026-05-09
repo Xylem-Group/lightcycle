@@ -1,4 +1,4 @@
-//! Firehose v2 gRPC server: live `Stream.Blocks` + `EndpointInfo.Info`.
+//! Firehose v2 gRPC server: `Stream.Blocks` + `Fetch.Block` + `EndpointInfo.Info`.
 //!
 //! v0.1 surface:
 //!
@@ -8,12 +8,15 @@
 //!   crate into the pipeline. Requests that supply either field get
 //!   a `FailedPrecondition` status with a clear message rather than
 //!   silent best-effort behavior.
+//! - **`Fetch.Block`** — point-in-time block lookup by height. Backed
+//!   by a [`BlockOracle`] (the CLI builds one over a dedicated
+//!   `GrpcSource` connection; future `lightcycle-store` cache impls
+//!   will compose). Only `BlockNumber` references are supported in
+//!   v0.1; `BlockHashAndNumber` and `Cursor` references return
+//!   `FailedPrecondition`. No transforms.
 //! - **`EndpointInfo.Info`** — minimal: chain name, BlockIdEncoding=HEX,
 //!   first_streamable left at 0/empty (we don't track upstream chain
 //!   genesis at v0.1).
-//! - **`Fetch.Block`** — not implemented. The proto compiles in
-//!   without us serving it; the route just isn't bound. Lands when
-//!   block storage is in place.
 //!
 //! ## Response shape
 //!
@@ -32,9 +35,10 @@
 use std::pin::Pin;
 
 use lightcycle_proto::firehose::v2::{
-    endpoint_info_server::EndpointInfo, info_response::BlockIdEncoding,
+    endpoint_info_server::EndpointInfo, fetch_server::Fetch as FetchSvc,
+    info_response::BlockIdEncoding, single_block_request::Reference,
     stream_server::Stream as StreamSvc, BlockMetadata, ForkStep, InfoRequest, InfoResponse,
-    Request, Response,
+    Request, Response, SingleBlockRequest, SingleBlockResponse,
 };
 use lightcycle_relayer::Output;
 use prost::Message;
@@ -46,6 +50,7 @@ use tracing::{debug, warn};
 
 use crate::encode::{encode_block, BLOCK_TYPE_URL};
 use crate::hub::Hub;
+use crate::oracle::SharedBlockOracle;
 
 /// Stream service. Holds a clone of the hub so each `blocks` RPC
 /// call subscribes to the live broadcast.
@@ -186,6 +191,121 @@ fn timestamp_from_ms(ms: i64) -> Timestamp {
     Timestamp {
         seconds: ms / 1000,
         nanos: ((ms % 1000) * 1_000_000) as i32,
+    }
+}
+
+/// `Fetch.Block` service: point-in-time block lookup. Holds a shared
+/// [`BlockOracle`](crate::oracle::BlockOracle) the call delegates to.
+///
+/// `Block` returns the canonical version of the block at the requested
+/// height, encoded into the same `sf.tron.type.v1.Block` `Any` payload
+/// that `Stream.Blocks` ships. Status mapping:
+///
+/// - `Ok(None)` from the oracle → `Status::not_found` (the chain has no
+///   block at that height yet, or the upstream returned nothing)
+/// - `Err(_)` from the oracle → `Status::internal` (RPC, decode, etc.)
+/// - `block_hash_and_number` / `cursor` references →
+///   `Status::failed_precondition` (v0.1 only resolves by number)
+/// - `transforms` non-empty → `Status::failed_precondition`
+#[derive(Clone)]
+pub struct FetchService {
+    oracle: SharedBlockOracle,
+}
+
+impl std::fmt::Debug for FetchService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchService").finish()
+    }
+}
+
+impl FetchService {
+    pub fn new(oracle: SharedBlockOracle) -> Self {
+        Self { oracle }
+    }
+}
+
+#[tonic::async_trait]
+impl FetchSvc for FetchService {
+    async fn block(
+        &self,
+        request: tonic::Request<SingleBlockRequest>,
+    ) -> Result<tonic::Response<SingleBlockResponse>, Status> {
+        let req = request.into_inner();
+
+        if !req.transforms.is_empty() {
+            return Err(Status::failed_precondition(
+                "transforms not implemented in v0.1",
+            ));
+        }
+
+        let height = match req.reference {
+            Some(Reference::BlockNumber(bn)) => bn.num,
+            Some(Reference::BlockHashAndNumber(_)) => {
+                return Err(Status::failed_precondition(
+                    "block_hash_and_number not implemented in v0.1; use block_number",
+                ));
+            }
+            Some(Reference::Cursor(_)) => {
+                return Err(Status::failed_precondition(
+                    "cursor reference not implemented in v0.1; use block_number",
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "no reference provided; one of block_number / block_hash_and_number / \
+                     cursor required",
+                ));
+            }
+        };
+
+        metrics::counter!("lightcycle_firehose_fetch_total", "result" => "in_flight")
+            .increment(1);
+        let started = std::time::Instant::now();
+
+        let outcome = self.oracle.fetch_block_by_number(height).await;
+
+        let elapsed = started.elapsed().as_secs_f64();
+        metrics::histogram!("lightcycle_firehose_fetch_duration_seconds").record(elapsed);
+
+        match outcome {
+            Ok(Some((buffered, finality))) => {
+                let block_id_hex = hex::encode(buffered.block_id.0);
+                let parent_id_hex = hex::encode(buffered.parent_id.0);
+                let timestamp_ms = buffered.decoded.header.timestamp_ms;
+                let metadata = BlockMetadata {
+                    num: buffered.height,
+                    id: block_id_hex,
+                    parent_num: buffered.height.saturating_sub(1),
+                    parent_id: parent_id_hex,
+                    lib_num: finality.solidified_head.unwrap_or(0),
+                    time: Some(timestamp_from_ms(timestamp_ms)),
+                };
+                let block_pb = encode_block(&buffered, finality);
+                let block_any = Any {
+                    type_url: BLOCK_TYPE_URL.into(),
+                    value: block_pb.encode_to_vec(),
+                };
+                metrics::counter!("lightcycle_firehose_fetch_total", "result" => "ok")
+                    .increment(1);
+                Ok(tonic::Response::new(SingleBlockResponse {
+                    block: Some(block_any),
+                    metadata: Some(metadata),
+                }))
+            }
+            Ok(None) => {
+                metrics::counter!("lightcycle_firehose_fetch_total", "result" => "not_found")
+                    .increment(1);
+                Err(Status::not_found(format!(
+                    "block {height} not available upstream"
+                )))
+            }
+            Err(e) => {
+                warn!(error = ?e, height, "Fetch.Block oracle error");
+                metrics::counter!("lightcycle_firehose_fetch_total", "result" => "error")
+                    .increment(1);
+                Err(Status::internal(format!("oracle error: {e}")))
+            }
+        }
     }
 }
 
@@ -389,5 +509,182 @@ mod tests {
             orphaned_tips: vec![BlockId([0xaa; 32])],
         };
         assert!(output_to_response(resolved).is_none());
+    }
+
+    // -- Fetch.Block service ----------------------------------------
+
+    use crate::oracle::BlockOracle;
+    use lightcycle_proto::firehose::v2::single_block_request::{
+        BlockHashAndNumber, BlockNumber, Cursor as CursorRef,
+    };
+    use std::sync::Arc;
+    use tonic::Code;
+
+    fn synth_buffered(height: u64) -> BufferedBlock {
+        BufferedBlock {
+            height,
+            block_id: BlockId([height as u8; 32]),
+            parent_id: BlockId([(height - 1) as u8; 32]),
+            fork_id: 0,
+            decoded: DecodedBlock {
+                header: DecodedHeader {
+                    height,
+                    block_id: BlockId([height as u8; 32]),
+                    parent_id: BlockId([(height - 1) as u8; 32]),
+                    raw_data_hash: [0u8; 32],
+                    tx_trie_root: [0u8; 32],
+                    timestamp_ms: 1_777_854_558_000,
+                    witness: Address([0x41; 21]),
+                    witness_signature: vec![],
+                    version: 34,
+                },
+                transactions: vec![],
+            },
+            tx_infos: vec![],
+        }
+    }
+
+    /// In-memory oracle. Holds a per-height answer; missing keys are
+    /// reported as `Ok(None)`. Pairs with [`ErrOracle`] for failure
+    /// cases.
+    struct VecOracle {
+        items: std::collections::HashMap<u64, (BufferedBlock, BlockFinality)>,
+    }
+    impl VecOracle {
+        fn new() -> Self {
+            Self {
+                items: Default::default(),
+            }
+        }
+        fn with(mut self, h: u64, sb: BufferedBlock, finality: BlockFinality) -> Self {
+            self.items.insert(h, (sb, finality));
+            self
+        }
+    }
+    #[async_trait::async_trait]
+    impl BlockOracle for VecOracle {
+        async fn fetch_block_by_number(
+            &self,
+            height: u64,
+        ) -> anyhow::Result<Option<(BufferedBlock, BlockFinality)>> {
+            Ok(self.items.get(&height).cloned())
+        }
+    }
+
+    struct ErrOracle;
+    #[async_trait::async_trait]
+    impl BlockOracle for ErrOracle {
+        async fn fetch_block_by_number(
+            &self,
+            _height: u64,
+        ) -> anyhow::Result<Option<(BufferedBlock, BlockFinality)>> {
+            Err(anyhow::anyhow!("synthetic upstream failure"))
+        }
+    }
+
+    fn req_by_number(num: u64) -> tonic::Request<SingleBlockRequest> {
+        tonic::Request::new(SingleBlockRequest {
+            reference: Some(Reference::BlockNumber(BlockNumber { num })),
+            transforms: vec![],
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_block_with_finality_when_oracle_has_it() {
+        let oracle = VecOracle::new().with(
+            100,
+            synth_buffered(100),
+            BlockFinality {
+                tier: FinalityTier::Finalized,
+                solidified_head: Some(120),
+            },
+        );
+        let svc = FetchService::new(Arc::new(oracle));
+        let resp = svc.block(req_by_number(100)).await.expect("ok").into_inner();
+
+        let md = resp.metadata.expect("metadata populated");
+        assert_eq!(md.num, 100);
+        assert_eq!(md.parent_num, 99);
+        assert_eq!(md.id.len(), 64);
+        // lib_num sourced from finality.solidified_head per ADR-0021.
+        assert_eq!(md.lib_num, 120);
+
+        let any = resp.block.expect("block any populated");
+        assert_eq!(any.type_url, BLOCK_TYPE_URL);
+
+        // Round-trip the embedded sf.tron.type.v1.Block to confirm the
+        // finality envelope is on the wire end-to-end.
+        use lightcycle_proto::sf::tron::type_v1 as tron_v1;
+        let decoded = tron_v1::Block::decode(any.value.as_slice()).expect("decode");
+        let f = decoded.finality.expect("finality");
+        assert_eq!(f.tier, tron_v1::FinalityTier::Finalized as i32);
+        assert_eq!(f.solidified_head_number, 120);
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_not_found_when_oracle_returns_none() {
+        let oracle = VecOracle::new(); // no entries
+        let svc = FetchService::new(Arc::new(oracle));
+        let err = svc.block(req_by_number(100)).await.unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_internal_when_oracle_errors() {
+        let svc = FetchService::new(Arc::new(ErrOracle));
+        let err = svc.block(req_by_number(100)).await.unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_block_hash_and_number_reference() {
+        let svc = FetchService::new(Arc::new(VecOracle::new()));
+        let req = tonic::Request::new(SingleBlockRequest {
+            reference: Some(Reference::BlockHashAndNumber(BlockHashAndNumber {
+                num: 100,
+                hash: "deadbeef".into(),
+            })),
+            transforms: vec![],
+        });
+        let err = svc.block(req).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_cursor_reference() {
+        let svc = FetchService::new(Arc::new(VecOracle::new()));
+        let req = tonic::Request::new(SingleBlockRequest {
+            reference: Some(Reference::Cursor(CursorRef {
+                cursor: "abc".into(),
+            })),
+            transforms: vec![],
+        });
+        let err = svc.block(req).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_missing_reference() {
+        let svc = FetchService::new(Arc::new(VecOracle::new()));
+        let req = tonic::Request::new(SingleBlockRequest {
+            reference: None,
+            transforms: vec![],
+        });
+        let err = svc.block(req).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_empty_transforms() {
+        let svc = FetchService::new(Arc::new(VecOracle::new()));
+        let req = tonic::Request::new(SingleBlockRequest {
+            reference: Some(Reference::BlockNumber(BlockNumber { num: 100 })),
+            transforms: vec![Any {
+                type_url: "x".into(),
+                value: vec![],
+            }],
+        });
+        let err = svc.block(req).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
     }
 }

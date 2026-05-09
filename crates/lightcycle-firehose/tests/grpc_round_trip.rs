@@ -7,13 +7,15 @@
 //! those are explicitly rejected at v0.1 and have unit-test coverage
 //! in `src/server.rs`. This test covers the live happy path.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use lightcycle_codec::{DecodedBlock, DecodedHeader};
-use lightcycle_firehose::{serve, Hub, BLOCK_TYPE_URL};
+use lightcycle_firehose::{serve, BlockOracle, Hub, SharedBlockOracle, BLOCK_TYPE_URL};
 use lightcycle_proto::firehose::v2::{
-    endpoint_info_client::EndpointInfoClient, stream_client::StreamClient, ForkStep, InfoRequest,
-    Request,
+    endpoint_info_client::EndpointInfoClient, fetch_client::FetchClient,
+    single_block_request::{BlockNumber, Reference},
+    stream_client::StreamClient, ForkStep, InfoRequest, Request, SingleBlockRequest,
 };
 use lightcycle_proto::sf::tron::type_v1 as tron_v1;
 use lightcycle_relayer::{BufferedBlock, Cursor, Output, StreamableBlock};
@@ -21,6 +23,24 @@ use lightcycle_types::{Address, BlockFinality, BlockId, FinalityTier, Step};
 use prost::Message;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
+
+/// Tiny in-memory oracle for tests. Holds nothing; every call returns
+/// `Ok(None)`. Used wherever a test only exercises the Stream side and
+/// doesn't care about Fetch behavior — `serve()` requires a `SharedBlockOracle`.
+struct EmptyOracle;
+#[async_trait::async_trait]
+impl BlockOracle for EmptyOracle {
+    async fn fetch_block_by_number(
+        &self,
+        _height: u64,
+    ) -> anyhow::Result<Option<(BufferedBlock, BlockFinality)>> {
+        Ok(None)
+    }
+}
+
+fn empty_oracle() -> SharedBlockOracle {
+    Arc::new(EmptyOracle) as SharedBlockOracle
+}
 
 fn synth_output(step: Step, height: u64) -> Output {
     let block = BufferedBlock {
@@ -77,7 +97,7 @@ async fn live_stream_round_trip() {
     let server = tokio::spawn({
         let hub = hub.clone();
         async move {
-            let _ = serve(addr, hub, "tron-test", async move {
+            let _ = serve(addr, hub, empty_oracle(), "tron-test", async move {
                 let _ = shutdown_rx.await;
             })
             .await;
@@ -155,7 +175,7 @@ async fn endpoint_info_round_trip() {
     let server = tokio::spawn({
         let hub = hub.clone();
         async move {
-            let _ = serve(addr, hub, "tron-mainnet", async move {
+            let _ = serve(addr, hub, empty_oracle(), "tron-mainnet", async move {
                 let _ = shutdown_rx.await;
             })
             .await;
@@ -185,6 +205,116 @@ async fn endpoint_info_round_trip() {
 }
 
 #[tokio::test]
+async fn fetch_block_round_trip() {
+    // Oracle holds one block at height 100 with a finalized envelope.
+    // Fetch.Block(num=100) over real gRPC returns it; Fetch.Block(num=999)
+    // returns NotFound; Fetch.Block(cursor=...) returns FailedPrecondition.
+    struct OneBlockOracle;
+    #[async_trait::async_trait]
+    impl BlockOracle for OneBlockOracle {
+        async fn fetch_block_by_number(
+            &self,
+            height: u64,
+        ) -> anyhow::Result<Option<(BufferedBlock, BlockFinality)>> {
+            if height == 100 {
+                let block = BufferedBlock {
+                    height: 100,
+                    block_id: BlockId([100u8; 32]),
+                    parent_id: BlockId([99u8; 32]),
+                    fork_id: 0,
+                    decoded: DecodedBlock {
+                        header: DecodedHeader {
+                            height: 100,
+                            block_id: BlockId([100u8; 32]),
+                            parent_id: BlockId([99u8; 32]),
+                            raw_data_hash: [0u8; 32],
+                            tx_trie_root: [0u8; 32],
+                            timestamp_ms: 1_777_854_558_000,
+                            witness: Address([0x41; 21]),
+                            witness_signature: vec![],
+                            version: 34,
+                        },
+                        transactions: vec![],
+                    },
+                    tx_infos: vec![],
+                };
+                Ok(Some((
+                    block,
+                    BlockFinality {
+                        tier: FinalityTier::Finalized,
+                        solidified_head: Some(120),
+                    },
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let hub = Hub::new(8);
+    let addr = pick_addr().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            let _ = serve(
+                addr,
+                hub,
+                Arc::new(OneBlockOracle) as SharedBlockOracle,
+                "tron-test",
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await;
+        }
+    });
+
+    let mut client = None;
+    for _ in 0..40 {
+        if let Ok(c) = FetchClient::connect(format!("http://{addr}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = client.expect("server didn't accept connections");
+
+    // Happy path
+    let resp = client
+        .block(SingleBlockRequest {
+            reference: Some(Reference::BlockNumber(BlockNumber { num: 100 })),
+            transforms: vec![],
+        })
+        .await
+        .expect("fetch ok")
+        .into_inner();
+    let md = resp.metadata.expect("metadata");
+    assert_eq!(md.num, 100);
+    assert_eq!(md.parent_num, 99);
+    assert_eq!(md.lib_num, 120, "lib_num sourced from solidified_head");
+    let any = resp.block.expect("block");
+    assert_eq!(any.type_url, BLOCK_TYPE_URL);
+    let decoded = tron_v1::Block::decode(any.value.as_slice()).expect("decode");
+    let f = decoded.finality.expect("finality envelope on wire");
+    assert_eq!(f.tier, tron_v1::FinalityTier::Finalized as i32);
+
+    // NotFound for a height the oracle doesn't know about
+    let err = client
+        .block(SingleBlockRequest {
+            reference: Some(Reference::BlockNumber(BlockNumber { num: 999 })),
+            transforms: vec![],
+        })
+        .await
+        .err()
+        .expect("expected NotFound");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
 async fn live_stream_rejects_cursor_request() {
     let hub = Hub::new(8);
     let addr = pick_addr().await;
@@ -192,7 +322,7 @@ async fn live_stream_rejects_cursor_request() {
     let server = tokio::spawn({
         let hub = hub.clone();
         async move {
-            let _ = serve(addr, hub, "tron-test", async move {
+            let _ = serve(addr, hub, empty_oracle(), "tron-test", async move {
                 let _ = shutdown_rx.await;
             })
             .await;
