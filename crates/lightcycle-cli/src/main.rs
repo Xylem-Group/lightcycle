@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lightcycle_source::HeadPoller;
+use lightcycle_relayer::{
+    GrpcBlockFetcher, RelayerService, ReorgConfig, ReorgEngine, VerifyPolicy,
+};
+use lightcycle_source::{GrpcSource, HeadPoller};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -42,8 +45,15 @@ enum LogFormat {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Run the relayer (head-tracking only in v0.1; full pipeline is incremental).
+    /// Run the lightweight head poller (HTTP RPC, head metadata only).
+    /// Cheap and works against any node including lite-fullnode; useful
+    /// for dashboards and the kulen comparison panel. For the full
+    /// decode + verify + reorg pipeline use `relay`.
     Stream(StreamArgs),
+    /// Run the live ingest pipeline: fetch blocks via gRPC, decode,
+    /// verify witness signatures, drive the reorg engine, log emitted
+    /// step events. The flagship subcommand.
+    Relay(RelayArgs),
     /// Inspect a single block over RPC.
     Inspect(InspectArgs),
     /// Print version and feature flags.
@@ -79,6 +89,70 @@ struct StreamArgs {
 }
 
 #[derive(Parser, Debug)]
+struct RelayArgs {
+    /// java-tron gRPC endpoint. Default targets the local node via
+    /// loopback. Same shape as `inspect` — the relay path uses the
+    /// same `Wallet.GetNowBlock` RPC.
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_GRPC_URL",
+        default_value = "http://127.0.0.1:50051"
+    )]
+    grpc_url: String,
+
+    /// Address to bind the Prometheus `/metrics` endpoint. Pick a port
+    /// distinct from `stream`'s exporter (also 9528 by default) so both
+    /// can coexist if you want to compare paths.
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_RELAY_METRICS_LISTEN",
+        default_value = "127.0.0.1:9529"
+    )]
+    metrics_listen: SocketAddr,
+
+    /// Poll interval, milliseconds. TRON blocks are ~3s; 1000ms gives
+    /// us 3 chances to catch each. Faster polling does not improve
+    /// latency below the upstream's block production rate but does
+    /// add load.
+    #[arg(long, env = "LIGHTCYCLE_RELAY_POLL_INTERVAL_MS", default_value_t = 1000)]
+    poll_interval_ms: u64,
+
+    /// Verify policy: `disabled` skips sigverify entirely; `lenient`
+    /// (default) accepts SM2-class blocks (~25% of mainnet) under the
+    /// documented pass-through caveat; `strict` rejects them.
+    #[arg(long, env = "LIGHTCYCLE_RELAY_VERIFY", default_value = "lenient")]
+    verify: VerifyPolicyArg,
+
+    /// Reorg engine: how many canonical blocks to keep in the live
+    /// buffer. Must exceed `--finality-depth`. 30 covers any realistic
+    /// TRON reorg.
+    #[arg(long, env = "LIGHTCYCLE_RELAY_BUFFER_WINDOW", default_value_t = 30)]
+    buffer_window: usize,
+
+    /// Reorg engine: confirmations until a block is emitted as
+    /// `Irreversible`. TRON's solidified rule is 19/27 SR confirmations.
+    #[arg(long, env = "LIGHTCYCLE_RELAY_FINALITY_DEPTH", default_value_t = 19)]
+    finality_depth: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum VerifyPolicyArg {
+    Disabled,
+    Lenient,
+    Strict,
+}
+
+impl From<VerifyPolicyArg> for VerifyPolicy {
+    fn from(v: VerifyPolicyArg) -> Self {
+        match v {
+            VerifyPolicyArg::Disabled => VerifyPolicy::Disabled,
+            VerifyPolicyArg::Lenient => VerifyPolicy::Lenient,
+            VerifyPolicyArg::Strict => VerifyPolicy::Strict,
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
 struct InspectArgs {
     /// Block height to fetch and decode. Omit to fetch the current
     /// head — which is the only option for nodes running LiteFullNode
@@ -111,6 +185,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Stream(args) => run_stream(args).await,
+        Cmd::Relay(args) => run_relay(args).await,
         Cmd::Inspect(args) => run_inspect(args).await,
         Cmd::Version => {
             println!("lightcycle {}", env!("CARGO_PKG_VERSION"));
@@ -191,6 +266,107 @@ async fn run_stream(args: StreamArgs) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+async fn run_relay(args: RelayArgs) -> Result<()> {
+    // Stand the metrics exporter up first so the very first scrape
+    // doesn't race the first poll.
+    PrometheusBuilder::new()
+        .with_http_listener(args.metrics_listen)
+        .install()
+        .context("install prometheus exporter")?;
+    lightcycle_relayer::describe_metrics();
+    metrics::describe_gauge!(
+        "lightcycle_info",
+        "build info: always 1, with version + feature labels"
+    );
+    metrics::gauge!(
+        "lightcycle_info",
+        "version" => env!("CARGO_PKG_VERSION"),
+        "subcommand" => "relay",
+    )
+    .set(1.0);
+
+    let verify_policy: VerifyPolicy = args.verify.into();
+
+    tracing::info!(
+        grpc_url = %args.grpc_url,
+        metrics_listen = %args.metrics_listen,
+        poll_interval_ms = args.poll_interval_ms,
+        verify_policy = ?verify_policy,
+        buffer_window = args.buffer_window,
+        finality_depth = args.finality_depth,
+        "starting relay pipeline"
+    );
+
+    // Connect, fetch the initial SR set if we'll be verifying. SR-set
+    // refresh-on-epoch-rotation is a follow-up; for now the set is
+    // pinned at startup, which works for runs shorter than a TRON
+    // maintenance period (~6h).
+    let mut source = GrpcSource::connect(args.grpc_url.clone())
+        .await
+        .with_context(|| format!("gRPC connect: {}", args.grpc_url))?;
+
+    let sr_set = if verify_policy != VerifyPolicy::Disabled {
+        let set = source
+            .fetch_active_sr_set()
+            .await
+            .context("fetch initial SR set")?;
+        tracing::info!(size = set.len(), "fetched active SR set");
+        Some(set)
+    } else {
+        tracing::info!("verify disabled; skipping SR set fetch");
+        None
+    };
+
+    let engine = ReorgEngine::new(ReorgConfig {
+        buffer_window: args.buffer_window,
+        finality_depth: args.finality_depth,
+    });
+    let fetcher = GrpcBlockFetcher::new(source);
+    let service = RelayerService::new(
+        fetcher,
+        engine,
+        sr_set,
+        verify_policy,
+        std::time::Duration::from_millis(args.poll_interval_ms.max(50)),
+    );
+
+    // The service is the producer; we drain the receiver and currently
+    // just log. Once the firehose gRPC server lands, this is where its
+    // multiplex hub will subscribe.
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(256);
+    let service_handle = tokio::spawn(service.run(output_tx));
+
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    // Drain emitted Outputs alongside the shutdown signal. The service
+    // already logs each block; we don't double-log here. The drain
+    // exists to (a) keep the channel non-full so the service doesn't
+    // back-pressure on send, and (b) act as the obvious wiring point
+    // for the firehose subscription manager.
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("ctrl-c received, shutting down relay");
+                break;
+            }
+            recv = output_rx.recv() => {
+                match recv {
+                    Some(_output) => {} // logged inside the service
+                    None => {
+                        tracing::warn!("relay service exited");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    drop(output_rx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), service_handle).await;
     Ok(())
 }
 
