@@ -27,15 +27,22 @@
 //!
 //! - [`decode_trc20_transfer`] / [`decode_trc20_approval`] — the two
 //!   universal TRC-20 events recognized by topic hash. Standalone,
-//!   ABI-registry-free helpers; full-ABI decoding is future work.
+//!   ABI-registry-free helpers.
+//!
+//! - [`abi`] — minimal ABI registry + event decoder for arbitrary
+//!   contract events. Operators register signatures like
+//!   `"Swap(address indexed sender, uint256 amount0In, ...)"`; the
+//!   registry computes the `topic[0]` hash and decodes matching logs
+//!   into structured [`abi::DecodedEvent`] values. Static-type subset
+//!   (address, bool, uintN, intN, bytesN) covers ~80% of real-world
+//!   contracts; dynamic types (string, bytes, T[]) deferred.
 //!
 //! Deferred (separate entry points, separate crates' job to provide
 //! inputs):
 //!
-//! - **Event log decoding (arbitrary contracts).** Needs an ABI
-//!   registry. Lives behind a future `decode_event(log, abi)` entry
-//!   point. v0.1 ships only the universal TRC-20 helpers above plus
-//!   raw [`Log`] passthrough.
+//! - **Dynamic ABI types** (`string`, `bytes`, `T[]`, tuples, structs).
+//!   The registry [`abi::EventSignature::parse`] returns a typed error
+//!   for these; expansion lands when a real consumer needs them.
 //! - **SM2 sigverify.** Investigated 2026-05-09 (java-tron #6588,
 //!   PR #6627): the SM2 codepath exists in `SignUtils` but is dormant
 //!   on mainnet — `isECKeyCryptoEngine` is hard-true and no mainnet
@@ -44,6 +51,7 @@
 //!   `WitnessAddressMismatch` here means a real bug or an attacker,
 //!   not a benign engine mismatch.
 
+pub mod abi;
 mod block;
 mod error;
 mod events;

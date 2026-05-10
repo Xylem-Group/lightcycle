@@ -42,7 +42,7 @@ use lightcycle_proto::firehose::v2::{
     Request, Response, SingleBlockRequest, SingleBlockResponse,
 };
 use lightcycle_relayer::{BufferedBlock, Cursor, Output, StreamableBlock};
-use lightcycle_store::SharedBlockCache;
+use lightcycle_store::{BlockArchive, SharedBlockCache};
 use lightcycle_types::{BlockFinality, BlockHeight, Step};
 use prost::Message;
 use prost_types::{Any, Timestamp};
@@ -75,6 +75,12 @@ pub struct StreamService {
     /// `BlockFinality` for cached (cursor-resumed) blocks at emit
     /// time. Same channel the relayer broadcasts to.
     solidified_head: Option<watch::Receiver<Option<BlockHeight>>>,
+    /// Persistent block archive. Backfill walker first walks the
+    /// archive (heights below `cache.min_height`) before chaining into
+    /// the cache walk. `None` keeps lightcycle on the in-memory-only
+    /// behavior; `Some(_)` extends backfill to the archive's retention
+    /// floor.
+    archive: Option<BlockArchive>,
 }
 
 impl StreamService {
@@ -83,6 +89,7 @@ impl StreamService {
             hub,
             block_cache: None,
             solidified_head: None,
+            archive: None,
         }
     }
 
@@ -96,6 +103,15 @@ impl StreamService {
     ) -> Self {
         self.block_cache = Some(cache);
         self.solidified_head = Some(solidified_head);
+        self
+    }
+
+    /// Attach a persistent block archive. Stream.Blocks backfill will
+    /// walk the archive when the consumer's resume height is below the
+    /// in-memory cache window, extending resume capability past the
+    /// in-memory horizon.
+    pub fn with_archive(mut self, archive: BlockArchive) -> Self {
+        self.archive = Some(archive);
         self
     }
 }
@@ -172,56 +188,123 @@ impl StreamSvc for StreamService {
                      and --block-cache-capacity > 0",
                 ));
             };
-            // Snapshot the relevant cache range under read lock,
-            // then drop the lock before doing anything else.
             let head = self.solidified_head.as_ref().and_then(|w| *w.borrow());
-            let snapshot = {
+
+            // Snapshot the cache range. We don't refuse-on-empty here
+            // anymore — when an archive is attached, an empty cache is
+            // recoverable as long as the archive covers the request.
+            let cache_window: Option<(BlockHeight, BlockHeight)> = {
                 let guard = cache.read().await;
-                let (Some(min_h), Some(max_h)) = (guard.min_height(), guard.max_height()) else {
-                    // Cache is empty — nothing to backfill from. The
-                    // honest response is "ask later," not silently
-                    // attaching to live (which would create a gap).
-                    return Err(Status::failed_precondition(
-                        "block cache is empty; cannot serve backfill yet",
-                    ));
-                };
-                if h < min_h {
-                    return Err(Status::failed_precondition(format!(
-                        "start height {h} is below cache window [{min_h}, {max_h}]; \
-                         backfill beyond the cache window is not yet supported"
-                    )));
+                match (guard.min_height(), guard.max_height()) {
+                    (Some(mn), Some(mx)) => Some((mn, mx)),
+                    _ => None,
                 }
-                if h > max_h.saturating_add(1) {
-                    // The +1 is the boundary case "start at the next
-                    // block after the current tip" — that's a valid
-                    // request that simply has zero backfill rows; we
-                    // should not error on it.
-                    return Err(Status::failed_precondition(format!(
-                        "start height {h} is ahead of cache tip {max_h}; \
-                         remove start_block_num or wait for the chain to advance"
-                    )));
+            };
+
+            // Stage 1: walk the archive for any heights below the
+            // cache's lower bound (or the entire request, if the cache
+            // is empty). The archive holds pre-encoded `pb::Block`
+            // bytes; we wrap them in a Response without decoding the
+            // full block — only enough to read metadata fields.
+            let archive_rows: Vec<Response> = match (&self.archive, cache_window) {
+                (Some(arc), Some((min_h, _))) if h < min_h => {
+                    archive_walk(arc, h, min_h.saturating_sub(1)).map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "archive walk failed for [{h}, {}]: {e}",
+                            min_h.saturating_sub(1)
+                        ))
+                    })?
                 }
-                // Walk min(h, max_h+1)..=max_h. Per-height lookup is
-                // O(log n) on the BTreeMap — fast in practice.
-                let upper = max_h;
-                let mut rows = Vec::new();
-                for height in h..=upper {
-                    if let Some((_id, buffered)) = guard.get_by_height(height) {
-                        rows.push(buffered);
-                    } else {
-                        // Height is in the [min, max] interval but the
-                        // entry was evicted between min/max snapshot
-                        // and the per-height lookup. Treat as cache
-                        // miss and refuse — this should be rare, and a
-                        // partial walk would create gaps the consumer
-                        // can't detect.
-                        return Err(Status::failed_precondition(format!(
-                            "block at height {height} evicted from cache mid-walk; \
-                             retry with the same start_block_num"
-                        )));
+                (Some(arc), None) => {
+                    // Cache is empty — try to serve entirely from the
+                    // archive. Bound the walk by the archive's max so
+                    // we don't ask for an impossible range.
+                    let max = arc
+                        .max_height()
+                        .map_err(|e| Status::internal(format!("archive max_height: {e}")))?;
+                    match max {
+                        Some(top) if top >= h => archive_walk(arc, h, top).map_err(|e| {
+                            Status::failed_precondition(format!(
+                                "archive walk failed for [{h}, {top}]: {e}"
+                            ))
+                        })?,
+                        _ => Vec::new(),
                     }
                 }
-                rows
+                _ => Vec::new(),
+            };
+
+            // After the archive walk, decide where the cache walk
+            // resumes from. If the archive walked nothing, cache walk
+            // starts at h. If the archive walked some heights, cache
+            // walk starts at archive's last_emitted + 1 (which equals
+            // cache.min_height when both are present).
+            let cache_walk_from: BlockHeight = archive_rows
+                .last()
+                .and_then(|r| r.metadata.as_ref().map(|m| m.num.saturating_add(1)))
+                .unwrap_or(h);
+
+            // Stage 2: walk the cache from `cache_walk_from` to its
+            // tip. Reject up front if the requested range falls
+            // entirely outside what cache + archive can cover.
+            let cache_rows: Vec<BufferedBlock> = match cache_window {
+                Some((min_h, max_h)) => {
+                    if cache_walk_from < min_h {
+                        // Should not happen given the staging above,
+                        // but guard against off-by-one bugs (e.g. an
+                        // empty archive that didn't advance the
+                        // cursor).
+                        return Err(Status::failed_precondition(format!(
+                            "start height {h} is below archive+cache coverage \
+                             [archive=?, cache_min={min_h}, cache_max={max_h}]"
+                        )));
+                    }
+                    if cache_walk_from > max_h.saturating_add(1) {
+                        return Err(Status::failed_precondition(format!(
+                            "start height {h} is ahead of cache tip {max_h}; \
+                             remove start_block_num or wait for the chain to advance"
+                        )));
+                    }
+                    let guard = cache.read().await;
+                    let mut rows = Vec::new();
+                    for height in cache_walk_from..=max_h {
+                        if let Some((_id, buffered)) = guard.get_by_height(height) {
+                            rows.push(buffered);
+                        } else {
+                            // Height is in the [min, max] interval but
+                            // the entry was evicted between min/max
+                            // snapshot and the per-height lookup.
+                            // Treat as cache miss and refuse — this
+                            // should be rare, and a partial walk would
+                            // create gaps the consumer can't detect.
+                            return Err(Status::failed_precondition(format!(
+                                "block at height {height} evicted from cache mid-walk; \
+                                 retry with the same start_block_num"
+                            )));
+                        }
+                    }
+                    rows
+                }
+                None => {
+                    // Cache is empty. archive_rows may have served the
+                    // entire request, or partially. If the archive
+                    // didn't reach the live tip, the consumer would
+                    // see a gap on the live side; reject unless the
+                    // archive is empty and we're effectively a
+                    // live-tail request from h.
+                    if archive_rows.is_empty() && self.archive.is_some() {
+                        return Err(Status::failed_precondition(
+                            "block cache is empty and archive does not cover this request; \
+                             reconnect after the relayer warms up",
+                        ));
+                    }
+                    if archive_rows.is_empty() {
+                        return Err(Status::failed_precondition(
+                            "block cache is empty; cannot serve backfill yet",
+                        ));
+                    }
+                    Vec::new()
+                }
             };
 
             metrics::counter!(
@@ -230,23 +313,25 @@ impl StreamSvc for StreamService {
             )
             .increment(1);
             metrics::histogram!("lightcycle_firehose_backfill_blocks")
-                .record(snapshot.len() as f64);
+                .record((archive_rows.len() + cache_rows.len()) as f64);
+            if !archive_rows.is_empty() {
+                metrics::counter!("lightcycle_firehose_archive_backfill_blocks_total")
+                    .increment(archive_rows.len() as u64);
+            }
 
-            snapshot
-                .into_iter()
-                .map(|buffered| {
-                    let height = buffered.height;
-                    let finality = BlockFinality::for_block(height, head, false);
-                    let cursor = Cursor::new(buffered.height, buffered.block_id);
-                    let sb = StreamableBlock {
-                        block: buffered,
-                        step: Step::New,
-                        finality,
-                        cursor,
-                    };
-                    streamable_to_response(sb, ForkStep::StepNew)
-                })
-                .collect()
+            let cache_responses = cache_rows.into_iter().map(|buffered| {
+                let height = buffered.height;
+                let finality = BlockFinality::for_block(height, head, false);
+                let cursor = Cursor::new(buffered.height, buffered.block_id);
+                let sb = StreamableBlock {
+                    block: buffered,
+                    step: Step::New,
+                    finality,
+                    cursor,
+                };
+                streamable_to_response(sb, ForkStep::StepNew)
+            });
+            archive_rows.into_iter().chain(cache_responses).collect()
         } else {
             Vec::new()
         };
@@ -289,6 +374,73 @@ impl StreamSvc for StreamService {
 
         Ok(tonic::Response::new(Box::pin(combined)))
     }
+}
+
+/// Walk the archive over `[lo, hi]` (inclusive) and project each row
+/// into a `Response`. Each archived value is `pb::Block`-encoded
+/// (written by the archiver task on `Output::Irreversible`); we
+/// re-emit those bytes directly as `Response.block.value` and decode
+/// only enough to populate `Response.metadata`. Cursor + step are
+/// reconstructed from the archive's known properties (archived blocks
+/// are by construction finalized with `fork_id = 0`).
+fn archive_walk(
+    archive: &BlockArchive,
+    lo: BlockHeight,
+    hi: BlockHeight,
+) -> Result<Vec<Response>, lightcycle_store::ArchiveError> {
+    use lightcycle_proto::sf::tron::type_v1 as pb;
+    use lightcycle_types::BlockId;
+
+    // Cap per-call walk size. 5000 archived blocks ≈ 4h at 3-second
+    // slot times — large enough for any sane resume, small enough that
+    // we don't OOM on a misbehaving consumer asking for everything.
+    const ARCHIVE_WALK_LIMIT: usize = 5000;
+
+    let rows = archive.range(lo, hi, ARCHIVE_WALK_LIMIT)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (height, block_id, payload) in rows {
+        // Decode just enough to populate metadata. pb::Block parses
+        // cheaply; we use it as the source of truth for parent_id,
+        // time, and the embedded finality.solidified_head_number.
+        let pb_block = match pb::Block::decode(payload.as_slice()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(height, error = ?e, "archive payload failed to decode; skipping");
+                metrics::counter!("lightcycle_firehose_archive_decode_errors_total").increment(1);
+                continue;
+            }
+        };
+        let parent_id_bytes: [u8; 32] = pb_block
+            .parent_id
+            .as_slice()
+            .try_into()
+            .unwrap_or([0u8; 32]);
+        let lib_num = pb_block
+            .finality
+            .as_ref()
+            .map(|f| f.solidified_head_number)
+            .unwrap_or(0);
+        let metadata = BlockMetadata {
+            num: height,
+            id: hex::encode(block_id.0),
+            parent_num: height.saturating_sub(1),
+            parent_id: hex::encode(parent_id_bytes),
+            lib_num,
+            time: pb_block.time,
+        };
+        let block_any = Any {
+            type_url: BLOCK_TYPE_URL.into(),
+            value: payload,
+        };
+        let cursor = Cursor::new(height, BlockId(block_id.0));
+        out.push(Response {
+            block: Some(block_any),
+            step: ForkStep::StepNew as i32,
+            cursor: hex::encode(cursor.to_bytes()),
+            metadata: Some(metadata),
+        });
+    }
+    Ok(out)
 }
 
 /// Encode a single StreamableBlock to a Firehose Response. Used by
@@ -390,17 +542,35 @@ fn timestamp_from_ms(ms: i64) -> Timestamp {
 #[derive(Clone)]
 pub struct FetchService {
     oracle: SharedBlockOracle,
+    /// Persistent block archive. On a cache miss inside the oracle's
+    /// caching decorator, the archive is checked before the upstream
+    /// RPC is invoked. None falls back to oracle-only behavior (the
+    /// v0.x default).
+    archive: Option<BlockArchive>,
 }
 
 impl std::fmt::Debug for FetchService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FetchService").finish()
+        f.debug_struct("FetchService")
+            .field("archive", &self.archive.is_some())
+            .finish()
     }
 }
 
 impl FetchService {
     pub fn new(oracle: SharedBlockOracle) -> Self {
-        Self { oracle }
+        Self {
+            oracle,
+            archive: None,
+        }
+    }
+
+    /// Attach a persistent block archive. Fetch.Block requests for
+    /// heights past the in-memory cache are served from the archive
+    /// instead of round-tripping to the upstream RPC.
+    pub fn with_archive(mut self, archive: BlockArchive) -> Self {
+        self.archive = Some(archive);
+        self
     }
 }
 
@@ -440,6 +610,37 @@ impl FetchSvc for FetchService {
 
         metrics::counter!("lightcycle_firehose_fetch_total", "result" => "in_flight").increment(1);
         let started = std::time::Instant::now();
+
+        // Archive fast-path: serves any block past the chain's
+        // finality threshold without a round-trip to the upstream RPC.
+        // Cache (held by the oracle's caching decorator) is still
+        // checked next on archive miss, so latest-head fetches retain
+        // sub-millisecond response time.
+        if let Some(archive) = &self.archive {
+            match archive.get(height) {
+                Ok(Some((block_id, payload))) => {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    metrics::histogram!("lightcycle_firehose_fetch_duration_seconds")
+                        .record(elapsed);
+                    metrics::counter!(
+                        "lightcycle_firehose_fetch_total",
+                        "result" => "archive_hit"
+                    )
+                    .increment(1);
+                    return Ok(tonic::Response::new(archive_hit_response(
+                        height, block_id, payload,
+                    )));
+                }
+                Ok(None) => {
+                    // Fall through to oracle.
+                }
+                Err(e) => {
+                    warn!(error = ?e, height, "archive read error; falling through to oracle");
+                    metrics::counter!("lightcycle_firehose_fetch_total", "result" => "archive_error")
+                        .increment(1);
+                }
+            }
+        }
 
         let outcome = self.oracle.fetch_block_by_number(height).await;
 
@@ -484,6 +685,44 @@ impl FetchSvc for FetchService {
                 Err(Status::internal(format!("oracle error: {e}")))
             }
         }
+    }
+}
+
+/// Build a `SingleBlockResponse` from an archived `pb::Block` payload.
+/// Same projection logic as `archive_walk` but for the Fetch.Block
+/// surface — the metadata is decoded out of the payload, the bytes are
+/// passed through verbatim as the `Response.block.value`.
+fn archive_hit_response(
+    height: BlockHeight,
+    block_id: lightcycle_types::BlockId,
+    payload: Vec<u8>,
+) -> SingleBlockResponse {
+    use lightcycle_proto::sf::tron::type_v1 as pb;
+
+    let pb_block = pb::Block::decode(payload.as_slice()).ok();
+    let parent_id_bytes: [u8; 32] = pb_block
+        .as_ref()
+        .and_then(|b| b.parent_id.as_slice().try_into().ok())
+        .unwrap_or([0u8; 32]);
+    let lib_num = pb_block
+        .as_ref()
+        .and_then(|b| b.finality.as_ref().map(|f| f.solidified_head_number))
+        .unwrap_or(0);
+    let time = pb_block.as_ref().and_then(|b| b.time);
+    let metadata = BlockMetadata {
+        num: height,
+        id: hex::encode(block_id.0),
+        parent_num: height.saturating_sub(1),
+        parent_id: hex::encode(parent_id_bytes),
+        lib_num,
+        time,
+    };
+    SingleBlockResponse {
+        block: Some(Any {
+            type_url: BLOCK_TYPE_URL.into(),
+            value: payload,
+        }),
+        metadata: Some(metadata),
     }
 }
 

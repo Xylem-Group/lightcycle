@@ -48,11 +48,15 @@ This brings up `java-tron` (chain peer), `lightcycle` (relayer), Prometheus + Gr
 ## CLI
 
 ```bash
-# Live ingest pipeline: decode + verify + reorg + serve Firehose v2 over gRPC
+# Live ingest pipeline: decode + verify + reorg + serve Firehose v2 over gRPC,
+# with persistent block archive + healthcheck for k8s / orchestrator deployment.
 lightcycle relay \
   --grpc-url http://localhost:50051 \
   --firehose-listen 0.0.0.0:13042 \
-  --metrics-listen 0.0.0.0:9529
+  --metrics-listen 0.0.0.0:9529 \
+  --health-listen 0.0.0.0:9530 \
+  --archive-path /var/lib/lightcycle/blocks.redb \
+  --archive-retention-blocks 0
 
 # Lightweight HTTP-RPC head poller (no decode, no firehose): for the
 # kulen-side comparison dashboard or a Grafana liveness panel.
@@ -65,13 +69,22 @@ lightcycle inspect --grpc-url http://localhost:50051 --block 60123456
 `relay` is the flagship subcommand. With `--firehose-listen` set, the
 Firehose v2 server exposes:
 
-- **`Stream.Blocks`** — live tail with optional in-cache backfill via
-  `start_block_num` or `cursor` (cache window defaults to ~1h of mainnet
-  blocks; tune with `--block-cache-capacity`).
-- **`Fetch.Block`** — point-in-time lookup by height, read-through over
-  the same in-memory cache the relayer feeds (cache hit short-circuits
-  the upstream RPC).
+- **`Stream.Blocks`** — live tail with backfill via `start_block_num`
+  or `cursor`. Backfill walks the in-memory `BlockCache` first; with
+  `--archive-path` set it falls through to the persistent archive,
+  letting consumers resume past the in-memory window. Tune with
+  `--block-cache-capacity` (default 1024 ≈ 1h of mainnet at 3s slots)
+  and `--archive-retention-blocks` (default 0 = keep everything).
+- **`Fetch.Block`** — point-in-time lookup by height. Cache hit
+  short-circuits the upstream RPC; archive hit short-circuits the
+  upstream RPC for any height past the cache window.
 - **`EndpointInfo.Info`** — chain identity for orchestrator sanity-check.
+
+`--health-listen` exposes `/healthz` (200 if alive) and `/readyz`
+(200 once the relayer has observed the chain's solidified head). Both
+are kubelet-probe-compatible. Bound separately from `--metrics-listen`
+so a misconfigured Prometheus scrape can't black-hole the readiness
+signal.
 
 ## Benchmarking
 

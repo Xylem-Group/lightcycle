@@ -460,6 +460,7 @@ async fn backfill_walks_cache_and_then_streams_live() {
     let backfill = lightcycle_firehose::StreamBackfill {
         cache: cache.clone(),
         solidified_head: head_rx,
+        archive: None,
     };
 
     let addr = pick_addr().await;
@@ -572,6 +573,7 @@ async fn backfill_dedups_when_cache_overlaps_live() {
     let backfill = lightcycle_firehose::StreamBackfill {
         cache: cache.clone(),
         solidified_head: head_rx,
+        archive: None,
     };
 
     let addr = pick_addr().await;
@@ -644,6 +646,339 @@ async fn backfill_dedups_when_cache_overlaps_live() {
         103,
         "expected 103 (102 should be dedup'd)"
     );
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn backfill_walks_archive_then_cache_then_live() {
+    // Archive holds 50..60 (older finalized blocks).
+    // Cache holds 60..63 (recent in-memory window).
+    // Subscribe with start_block_num=50.
+    // Expect: 50..60 from archive, 60..63 from cache, then 63 from
+    // live. (Archive and cache abut at 60; cache wins for 60 since
+    // archive_walk emits up to cache.min_height-1 = 59.)
+    let dir = tempfile::tempdir().unwrap();
+    let archive = lightcycle_store::BlockArchive::open(dir.path().join("archive.redb")).unwrap();
+    for h in 50..60u64 {
+        let pb = tron_v1::Block {
+            number: h,
+            id: vec![h as u8; 32],
+            parent_id: vec![(h - 1) as u8; 32],
+            time: Some(prost_types::Timestamp {
+                seconds: 1_777_854_558 + h as i64,
+                nanos: 0,
+            }),
+            header: None,
+            transactions: vec![],
+            finality: Some(tron_v1::Finality {
+                tier: tron_v1::FinalityTier::Finalized as i32,
+                solidified_head_number: 100,
+            }),
+        };
+        archive
+            .put(h, BlockId([h as u8; 32]), &pb.encode_to_vec())
+            .unwrap();
+    }
+
+    let cache = lightcycle_store::new_shared::<BufferedBlock>(16);
+    {
+        let mut g = cache.write().await;
+        for h in 60..63u64 {
+            let buffered = BufferedBlock {
+                height: h,
+                block_id: BlockId([h as u8; 32]),
+                parent_id: BlockId([(h - 1) as u8; 32]),
+                fork_id: 0,
+                decoded: DecodedBlock {
+                    header: DecodedHeader {
+                        height: h,
+                        block_id: BlockId([h as u8; 32]),
+                        parent_id: BlockId([(h - 1) as u8; 32]),
+                        raw_data_hash: [0u8; 32],
+                        tx_trie_root: [0u8; 32],
+                        timestamp_ms: 1_777_854_558_000 + h as i64,
+                        witness: Address([0x41; 21]),
+                        witness_signature: vec![],
+                        version: 34,
+                    },
+                    transactions: vec![],
+                },
+                tx_infos: vec![],
+            };
+            g.insert(h, buffered.block_id, buffered);
+        }
+    }
+
+    let hub = Hub::new(64);
+    let (_head_tx, head_rx) =
+        tokio::sync::watch::channel::<Option<lightcycle_types::BlockHeight>>(None);
+    let backfill = lightcycle_firehose::StreamBackfill {
+        cache: cache.clone(),
+        solidified_head: head_rx,
+        archive: Some(archive.clone()),
+    };
+
+    let addr = pick_addr().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            let _ = serve(
+                addr,
+                hub,
+                empty_oracle(),
+                "tron-test",
+                Some(backfill),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await;
+        }
+    });
+
+    let mut client = None;
+    for _ in 0..40 {
+        if let Ok(c) = StreamClient::connect(format!("http://{addr}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = client.expect("server didn't accept connections");
+
+    let mut stream = client
+        .blocks(Request {
+            start_block_num: 50,
+            cursor: String::new(),
+            stop_block_num: 0,
+            final_blocks_only: false,
+            transforms: vec![],
+        })
+        .await
+        .expect("stream request accepted")
+        .into_inner();
+
+    // 13 backfill frames: 50..60 from archive, 60..63 from cache.
+    let mut got = Vec::new();
+    for _ in 50..63u64 {
+        let r = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("backfill frame timed out")
+            .expect("stream ended early")
+            .expect("backfill frame is Err");
+        got.push(r.metadata.unwrap().num);
+    }
+    assert_eq!(got, (50..63u64).collect::<Vec<_>>());
+
+    // Live tail: push 63.
+    hub.sender()
+        .send(synth_output(Step::New, 63))
+        .expect("broadcast send");
+    let r = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("live frame timed out")
+        .expect("stream ended")
+        .expect("live frame is Err");
+    assert_eq!(r.metadata.unwrap().num, 63);
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn fetch_block_archive_hit_short_circuits_oracle() {
+    // Pre-populate archive with height 42. FetchService is wired with
+    // archive + an oracle that would return None. Expect the Fetch
+    // call to succeed with the archived bytes (not a NotFound).
+    let dir = tempfile::tempdir().unwrap();
+    let archive = lightcycle_store::BlockArchive::open(dir.path().join("a.redb")).unwrap();
+    let pb = tron_v1::Block {
+        number: 42,
+        id: vec![42u8; 32],
+        parent_id: vec![41u8; 32],
+        time: Some(prost_types::Timestamp {
+            seconds: 1_777_854_600,
+            nanos: 0,
+        }),
+        header: None,
+        transactions: vec![],
+        finality: Some(tron_v1::Finality {
+            tier: tron_v1::FinalityTier::Finalized as i32,
+            solidified_head_number: 100,
+        }),
+    };
+    archive
+        .put(42, BlockId([42u8; 32]), &pb.encode_to_vec())
+        .unwrap();
+
+    // Stand the firehose up directly via the lib's `serve` so the
+    // archive flows through to FetchService.
+    let cache = lightcycle_store::new_shared::<BufferedBlock>(4);
+    let (_head_tx, head_rx) =
+        tokio::sync::watch::channel::<Option<lightcycle_types::BlockHeight>>(None);
+    let backfill = lightcycle_firehose::StreamBackfill {
+        cache,
+        solidified_head: head_rx,
+        archive: Some(archive),
+    };
+    let hub = Hub::new(16);
+    let addr = pick_addr().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let _ = serve(
+            addr,
+            hub,
+            empty_oracle(),
+            "tron-test",
+            Some(backfill),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await;
+    });
+
+    let mut client = None;
+    for _ in 0..40 {
+        if let Ok(c) = FetchClient::connect(format!("http://{addr}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = client.expect("server didn't accept Fetch");
+
+    let resp = client
+        .block(SingleBlockRequest {
+            transforms: vec![],
+            reference: Some(Reference::BlockNumber(BlockNumber { num: 42 })),
+        })
+        .await
+        .expect("fetch ok despite oracle returning None")
+        .into_inner();
+    let md = resp.metadata.expect("metadata present");
+    assert_eq!(md.num, 42);
+    let any = resp.block.expect("block payload present");
+    assert_eq!(any.type_url, BLOCK_TYPE_URL);
+    let decoded = tron_v1::Block::decode(any.value.as_slice()).expect("decode pb::Block");
+    assert_eq!(decoded.number, 42);
+    assert_eq!(
+        decoded.finality.unwrap().tier,
+        tron_v1::FinalityTier::Finalized as i32
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn backfill_below_archive_floor_returns_failed_precondition() {
+    // Archive starts at height 100; cache starts at height 110.
+    // Subscribe with start_block_num=50 — below archive floor.
+    let dir = tempfile::tempdir().unwrap();
+    let archive = lightcycle_store::BlockArchive::open(dir.path().join("a.redb")).unwrap();
+    for h in 100..105u64 {
+        let pb = tron_v1::Block {
+            number: h,
+            id: vec![h as u8; 32],
+            parent_id: vec![(h - 1) as u8; 32],
+            time: None,
+            header: None,
+            transactions: vec![],
+            finality: Some(tron_v1::Finality {
+                tier: tron_v1::FinalityTier::Finalized as i32,
+                solidified_head_number: 200,
+            }),
+        };
+        archive
+            .put(h, BlockId([h as u8; 32]), &pb.encode_to_vec())
+            .unwrap();
+    }
+    let cache = lightcycle_store::new_shared::<BufferedBlock>(16);
+    {
+        let mut g = cache.write().await;
+        for h in 110..113u64 {
+            let buffered = BufferedBlock {
+                height: h,
+                block_id: BlockId([h as u8; 32]),
+                parent_id: BlockId([(h - 1) as u8; 32]),
+                fork_id: 0,
+                decoded: DecodedBlock {
+                    header: DecodedHeader {
+                        height: h,
+                        block_id: BlockId([h as u8; 32]),
+                        parent_id: BlockId([(h - 1) as u8; 32]),
+                        raw_data_hash: [0u8; 32],
+                        tx_trie_root: [0u8; 32],
+                        timestamp_ms: 0,
+                        witness: Address([0x41; 21]),
+                        witness_signature: vec![],
+                        version: 34,
+                    },
+                    transactions: vec![],
+                },
+                tx_infos: vec![],
+            };
+            g.insert(h, buffered.block_id, buffered);
+        }
+    }
+
+    let hub = Hub::new(64);
+    let (_head_tx, head_rx) =
+        tokio::sync::watch::channel::<Option<lightcycle_types::BlockHeight>>(None);
+    let backfill = lightcycle_firehose::StreamBackfill {
+        cache,
+        solidified_head: head_rx,
+        archive: Some(archive),
+    };
+    let addr = pick_addr().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            let _ = serve(
+                addr,
+                hub,
+                empty_oracle(),
+                "tron-test",
+                Some(backfill),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await;
+        }
+    });
+
+    let mut client = None;
+    for _ in 0..40 {
+        if let Ok(c) = StreamClient::connect(format!("http://{addr}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = client.expect("server didn't accept connections");
+
+    // Resume from 50 — both below archive (100) and cache (110).
+    // The current implementation walks the archive starting at 50;
+    // the archive returns no rows for [50, 99] (range scan finds
+    // nothing); then the cache walker discovers cache_walk_from=50
+    // is below cache.min_height=110 and returns FailedPrecondition.
+    let err = client
+        .blocks(Request {
+            start_block_num: 50,
+            cursor: String::new(),
+            stop_block_num: 0,
+            final_blocks_only: false,
+            transforms: vec![],
+        })
+        .await
+        .expect_err("expected FailedPrecondition");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

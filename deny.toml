@@ -2,16 +2,7 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = [
-    # bincode 1.x — the team announced a permanent end of maintenance
-    # in 2025 (doxxing/harassment incident, not a security flaw). 1.3.3
-    # is what the team itself called a "complete version not in need of
-    # updates." We use bincode only via the persistence layer in
-    # lightcycle-store; replacing it (postcard / bitcode / rkyv) is on
-    # the roadmap but not load-bearing while the crate is still a stub.
-    # Re-evaluate when lightcycle-store grows real persistence.
-    "RUSTSEC-2025-0141",
-]
+ignore = []
 
 [licenses]
 allow = [
