@@ -18,6 +18,8 @@ use lightcycle_source::{GrpcSource, HeadPoller};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod health;
+
 #[derive(Parser, Debug)]
 #[command(name = "lightcycle", version, about = "TRON streaming relayer")]
 struct Cli {
@@ -160,6 +162,15 @@ struct RelayArgs {
     /// (engine still drives, just no consumers).
     #[arg(long, env = "LIGHTCYCLE_RELAY_FIREHOSE_LISTEN")]
     firehose_listen: Option<SocketAddr>,
+
+    /// Bind a tiny HTTP healthcheck server here, separate from the
+    /// metrics exporter. Exposes `/healthz` (200 if process is alive)
+    /// and `/readyz` (200 once the relayer has seen at least one
+    /// chain-reported solidified head; 503 before then). Required for
+    /// kubernetes readiness probes and any orchestrator that gates
+    /// traffic on health. When unset, no health endpoint is exposed.
+    #[arg(long, env = "LIGHTCYCLE_RELAY_HEALTH_LISTEN")]
+    health_listen: Option<SocketAddr>,
 
     /// Chain identity reported by `EndpointInfo.Info`. Defaults to
     /// "tron-mainnet" since that's what the LIGHTCYCLE_GRPC_URL
@@ -376,6 +387,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         .context("install prometheus exporter")?;
     lightcycle_relayer::describe_metrics();
     lightcycle_store::describe_metrics();
+    health::describe_metrics();
     metrics::describe_gauge!(
         "lightcycle_info",
         "build info: always 1, with version + feature labels"
@@ -509,6 +521,29 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
     // for the engine's burst pattern.
     let (output_tx, output_rx) = tokio::sync::mpsc::channel(256);
     let service_handle = tokio::spawn(service.run(output_tx));
+
+    // Spawn the healthcheck server when configured. Reads the same
+    // solidified-head watch the relayer broadcasts to, so /readyz
+    // flips to 200 on the first successful tick. Independent of the
+    // firehose surface — operators running log-only mode still want
+    // a readiness signal.
+    let (health_shutdown_tx, health_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let health_handle = if let Some(listen) = args.health_listen {
+        let head_rx_for_health = head_rx.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = health::serve(listen, head_rx_for_health, async move {
+                let _ = health_shutdown_rx.await;
+            })
+            .await
+            {
+                tracing::error!(error = %e, "health server exited with error");
+            }
+        }))
+    } else {
+        // Discard the receiver so the shutdown sender doesn't dangle.
+        drop(health_shutdown_rx);
+        None
+    };
 
     // Wire the firehose gRPC server when the operator asked for it.
     // The hub pump task drains output_rx → broadcast; the gRPC server
@@ -699,6 +734,14 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         let _ = server_shutdown_tx.send(());
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_handle).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pump_handle).await;
+    }
+    if let Some(h) = health_handle {
+        let _ = health_shutdown_tx.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+    } else {
+        // No server to signal; drop the sender so the receiver-half
+        // we already dropped doesn't cause a clippy warning.
+        drop(health_shutdown_tx);
     }
     if let Some(h) = sr_refresh_handle {
         h.abort();
