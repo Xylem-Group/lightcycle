@@ -48,15 +48,30 @@ This brings up `java-tron` (chain peer), `lightcycle` (relayer), Prometheus + Gr
 ## CLI
 
 ```bash
-# Live tail from the head of chain
-lightcycle stream --source p2p://localhost:18888 --grpc-listen 0.0.0.0:13042
+# Live ingest pipeline: decode + verify + reorg + serve Firehose v2 over gRPC
+lightcycle relay \
+  --grpc-url http://localhost:50051 \
+  --firehose-listen 0.0.0.0:13042 \
+  --metrics-listen 0.0.0.0:9529
 
-# Backfill from a height, then continue tailing
-lightcycle stream --source p2p://localhost:18888 --start-block 60000000
+# Lightweight HTTP-RPC head poller (no decode, no firehose): for the
+# kulen-side comparison dashboard or a Grafana liveness panel.
+lightcycle stream --rpc-url http://localhost:8090
 
-# Inspect a single block (debugging)
-lightcycle inspect --source rpc://localhost:8090 --block 60123456
+# Inspect a single block over gRPC (debugging)
+lightcycle inspect --grpc-url http://localhost:50051 --block 60123456
 ```
+
+`relay` is the flagship subcommand. With `--firehose-listen` set, the
+Firehose v2 server exposes:
+
+- **`Stream.Blocks`** — live tail with optional in-cache backfill via
+  `start_block_num` or `cursor` (cache window defaults to ~1h of mainnet
+  blocks; tune with `--block-cache-capacity`).
+- **`Fetch.Block`** — point-in-time lookup by height, read-through over
+  the same in-memory cache the relayer feeds (cache hit short-circuits
+  the upstream RPC).
+- **`EndpointInfo.Info`** — chain identity for orchestrator sanity-check.
 
 ## Benchmarking
 
