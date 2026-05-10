@@ -71,10 +71,12 @@
 //!    diffs of the active witness set. Cold restarts re-derive from the
 //!    nearest checkpoint instead of replaying from genesis. Not yet wired.
 
+mod archive;
 mod cache;
 mod consistency;
 mod cursor_store;
 
+pub use archive::{describe_archive_metrics, ArchiveError, BlockArchive};
 pub use cache::{describe_cache_metrics, new_shared, BlockCache, SharedBlockCache};
 pub use consistency::{
     describe_metrics, ConsistencyHorizonObserver, ConsistencySource, FinalityFromChain,
