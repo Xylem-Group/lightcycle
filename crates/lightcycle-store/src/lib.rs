@@ -51,10 +51,13 @@
 //!    SLO" mandates for lightcycle. Currently the only landed surface;
 //!    the relayer feeds it observations.
 //!
-//! 2. **Block cache** — last N unsolidified blocks held in memory for
-//!    reorg replay, with spill to `redb` when N grows. The reorg engine
-//!    in `lightcycle-relayer` walks this on canonical-chain switches.
-//!    Not yet wired.
+//! 2. **Block cache** — bounded in-memory cache of recent blocks,
+//!    indexed by both height and id, generic over the stored value
+//!    so this crate doesn't pull in `lightcycle-relayer`. See
+//!    [`BlockCache`] / [`SharedBlockCache`]. Wired downstream by the
+//!    relayer (writes on every emission) and by the firehose Fetch
+//!    handler (reads). Spill to `redb` for blocks that age past the
+//!    bounded window is a follow-up.
 //!
 //! 3. **Cursor store** — per-consumer `{height, blockId, forkId}`
 //!    checkpoints, persisted so a consumer reconnect after a process
@@ -65,8 +68,10 @@
 //!    diffs of the active witness set. Cold restarts re-derive from the
 //!    nearest checkpoint instead of replaying from genesis. Not yet wired.
 
+mod cache;
 mod consistency;
 
+pub use cache::{describe_cache_metrics, new_shared, BlockCache, SharedBlockCache};
 pub use consistency::{
     describe_metrics, ConsistencyHorizonObserver, ConsistencySource, FinalityFromChain,
     BLOCK_SEEN_TO_FINALIZED_SECONDS_METRIC,
