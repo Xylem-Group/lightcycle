@@ -90,6 +90,9 @@ primitive-types = { version = "0.13", features = ["serde"] }
 # Bench
 criterion = "0.5"
 
+# Test utilities
+tempfile = "3.10"
+
 # Internal
 lightcycle-proto    = { path = "crates/lightcycle-proto",    version = "0.0.1" }
 lightcycle-types    = { path = "crates/lightcycle-types",    version = "0.0.1" }

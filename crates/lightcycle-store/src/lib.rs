@@ -60,9 +60,12 @@
 //!    bounded window is a follow-up.
 //!
 //! 3. **Cursor store** — per-consumer `{height, blockId, forkId}`
-//!    checkpoints, persisted so a consumer reconnect after a process
-//!    restart resumes deterministically. Optional in v0.1; useful later
-//!    for ops dashboards. Not yet wired.
+//!    checkpoints persisted in a redb-backed file so a consumer
+//!    reconnecting after a process restart resumes deterministically.
+//!    See [`CursorStore`]. Available; the firehose layer wires it
+//!    in when the operator passes a path. Per ADR-0021 the store is
+//!    explicitly NOT a cross-replica consistency primitive — each
+//!    replica tracks the consumers attached to it.
 //!
 //! 4. **SR set checkpoints** — trusted starting point + maintenance-period
 //!    diffs of the active witness set. Cold restarts re-derive from the
@@ -70,9 +73,11 @@
 
 mod cache;
 mod consistency;
+mod cursor_store;
 
 pub use cache::{describe_cache_metrics, new_shared, BlockCache, SharedBlockCache};
 pub use consistency::{
     describe_metrics, ConsistencyHorizonObserver, ConsistencySource, FinalityFromChain,
     BLOCK_SEEN_TO_FINALIZED_SECONDS_METRIC,
 };
+pub use cursor_store::{describe_cursor_store_metrics, CursorStore, CursorStoreError};
