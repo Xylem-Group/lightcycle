@@ -147,6 +147,17 @@ impl<T: Clone> BlockCache<T> {
         Some((height, value.clone()))
     }
 
+    /// Remove the entry for `id` if present. Returns the removed
+    /// `(height, value)` or `None` if the id wasn't cached. Used by
+    /// the relayer on `Output::Undo` to drop an orphaned block before
+    /// the new canonical block at that height arrives — keeps the
+    /// cache reflecting canonical-only state at all times.
+    pub fn remove_by_id(&mut self, id: BlockId) -> Option<(BlockHeight, T)> {
+        let height = self.by_id.remove(&id)?;
+        let (_, value) = self.by_height.remove(&height)?;
+        Some((height, value))
+    }
+
     /// Drop every entry strictly below `height`. Returns the number
     /// of entries removed. Used after a finalized-tier transition so
     /// the cache stops paying for blocks that downstream consumers
@@ -280,6 +291,28 @@ mod tests {
         assert_eq!(c.len(), 1);
         // Value updated to 999.
         assert_eq!(c.get_by_height(100), Some((id(1), 999)));
+    }
+
+    #[test]
+    fn remove_by_id_clears_both_indices() {
+        let mut c = BlockCache::<u32>::new(4);
+        c.insert(100, id(0xa), 100);
+        c.insert(101, id(0xb), 101);
+        let removed = c.remove_by_id(id(0xa));
+        assert_eq!(removed, Some((100, 100)));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.get_by_height(100), None);
+        assert_eq!(c.get_by_id(id(0xa)), None);
+        // Sibling untouched.
+        assert_eq!(c.get_by_height(101), Some((id(0xb), 101)));
+    }
+
+    #[test]
+    fn remove_by_id_for_unknown_id_is_noop() {
+        let mut c = BlockCache::<u32>::new(4);
+        c.insert(100, id(0xa), 100);
+        assert_eq!(c.remove_by_id(id(0xb)), None);
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

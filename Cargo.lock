@@ -1407,6 +1407,7 @@ dependencies = [
  "lightcycle-codec",
  "lightcycle-proto",
  "lightcycle-relayer",
+ "lightcycle-store",
  "lightcycle-types",
  "metrics",
  "prost",

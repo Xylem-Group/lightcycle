@@ -127,8 +127,12 @@ struct RelayArgs {
     poll_interval_ms: u64,
 
     /// Verify policy: `disabled` skips sigverify entirely; `lenient`
-    /// (default) accepts SM2-class blocks (~25% of mainnet) under the
-    /// documented pass-through caveat; `strict` rejects them.
+    /// (default) tolerates `WitnessAddressMismatch` under the
+    /// pass-through caveat (useful around SR-set rotation windows);
+    /// `strict` rejects any verify failure. SM2 was once feared as a
+    /// dual-engine signing pathway; investigation 2026-05-09 confirmed
+    /// it's dormant in java-tron and unused on mainnet, so `strict` is
+    /// correct in principle once SR-set refresh is battle-tested.
     #[arg(long, env = "LIGHTCYCLE_RELAY_VERIFY", default_value = "lenient")]
     verify: VerifyPolicyArg,
 
@@ -173,6 +177,18 @@ struct RelayArgs {
     /// roughly an hour of TRON blocks at 3s spacing.
     #[arg(long, env = "LIGHTCYCLE_RELAY_HUB_CAPACITY", default_value_t = 1024)]
     firehose_hub_capacity: usize,
+
+    /// Block cache capacity (in blocks) for read-through cache the
+    /// firehose `Fetch.Block` handler probes before falling through
+    /// to upstream RPC. The relayer writes on every emission. 1024
+    /// covers ~1h of mainnet at 3s blocks; tune up if you expect
+    /// frequent backfill of older heights.
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_RELAY_BLOCK_CACHE_CAPACITY",
+        default_value_t = 1024
+    )]
+    block_cache_capacity: usize,
 
     /// Whether to fetch the `TransactionInfo` side channel for each
     /// block (logs, internal txs, resource accounting). Default true:
@@ -438,13 +454,28 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         finality_depth: args.finality_depth,
     });
     let fetcher = GrpcBlockFetcher::new(source).with_fetch_tx_info(args.fetch_tx_info);
-    let service = RelayerService::new(
+
+    // Block cache + solidified-head broadcast — wired only when the
+    // operator enabled the firehose surface. With no consumers there
+    // is no reason to spend memory caching blocks or to keep an
+    // extra watch channel hot.
+    let block_cache: Option<lightcycle_store::SharedBlockCache<lightcycle_relayer::BufferedBlock>> =
+        args.firehose_listen
+            .map(|_| lightcycle_store::new_shared(args.block_cache_capacity));
+    let (head_tx, head_rx) =
+        tokio::sync::watch::channel::<Option<lightcycle_types::BlockHeight>>(None);
+
+    let mut service = RelayerService::new(
         fetcher,
         engine,
         sr_set_rx,
         verify_policy,
         std::time::Duration::from_millis(args.poll_interval_ms.max(50)),
-    );
+    )
+    .with_solidified_head_tx(head_tx);
+    if let Some(cache) = block_cache.clone() {
+        service = service.with_block_cache(cache);
+    }
 
     // mpsc from service to either the hub (firehose enabled) or a
     // direct drain (firehose disabled). 256 is a comfortable buffer
@@ -457,6 +488,8 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
     // serves Stream.Blocks subscribers from the broadcast.
     let firehose_handles = if let Some(listen) = args.firehose_listen {
         lightcycle_firehose::describe_metrics();
+        lightcycle_firehose::describe_oracle_metrics();
+        lightcycle_store::describe_cache_metrics();
         let hub = lightcycle_firehose::Hub::new(args.firehose_hub_capacity);
         let pump_handle = hub.pump_from(output_rx);
 
@@ -469,8 +502,21 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         let oracle_source = lightcycle_source::GrpcSource::connect(args.grpc_url.clone())
             .await
             .with_context(|| format!("gRPC connect (Fetch.Block oracle): {}", args.grpc_url))?;
-        let oracle: lightcycle_firehose::SharedBlockOracle =
-            std::sync::Arc::new(GrpcBlockOracle::new(oracle_source));
+        let upstream_oracle = GrpcBlockOracle::new(oracle_source);
+        // Wrap in the read-through cache so cached recent blocks
+        // short-circuit upstream RPC. Cache is the same Arc the
+        // relayer writes into.
+        let oracle: lightcycle_firehose::SharedBlockOracle = match block_cache.clone() {
+            Some(cache) => std::sync::Arc::new(lightcycle_firehose::CachingBlockOracle::new(
+                cache,
+                upstream_oracle,
+                head_rx.clone(),
+            )),
+            // Should not happen — block_cache is Some when firehose_listen is Some,
+            // by construction above. But if the wiring ever drifts, fall back
+            // gracefully to the bare upstream oracle.
+            None => std::sync::Arc::new(upstream_oracle),
+        };
 
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let chain_name = args.firehose_chain_name.clone();

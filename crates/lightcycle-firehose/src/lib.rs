@@ -39,7 +39,7 @@ mod server;
 
 pub use encode::{encode_block, BLOCK_TYPE_URL};
 pub use hub::Hub;
-pub use oracle::{BlockOracle, SharedBlockOracle};
+pub use oracle::{describe_oracle_metrics, BlockOracle, CachingBlockOracle, SharedBlockOracle};
 pub use server::{EndpointInfoService, FetchService, StreamService};
 
 use std::net::SocketAddr;

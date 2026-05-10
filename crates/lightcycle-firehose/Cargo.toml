@@ -11,6 +11,7 @@ lightcycle-types.workspace = true
 lightcycle-proto.workspace = true
 lightcycle-relayer.workspace = true
 lightcycle-codec.workspace = true
+lightcycle-store.workspace = true
 
 tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 tokio-stream.workspace = true

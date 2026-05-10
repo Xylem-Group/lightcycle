@@ -61,14 +61,14 @@ use lightcycle_codec::{
     CodecError, DecodedBlock, DecodedTxInfo,
 };
 use lightcycle_source::GrpcSource;
-use lightcycle_store::ConsistencyHorizonObserver;
+use lightcycle_store::{ConsistencyHorizonObserver, SharedBlockCache};
 use lightcycle_types::{BlockHeight, SrSet};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-use crate::engine::{Output, ReorgEngine, ReorgError};
+use crate::engine::{BufferedBlock, Output, ReorgEngine, ReorgError};
 
 /// Policy for how to react to verify failures. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -233,6 +233,18 @@ pub struct RelayerService<F: BlockFetcher> {
     /// engine is sync-pure; the observer carries `Instant` state and
     /// the metric emit is a service-layer concern.
     horizon: ConsistencyHorizonObserver,
+    /// Optional read-through block cache shared with the firehose
+    /// `Fetch.Block` handler. When `Some`, every emitted `Output::New`
+    /// inserts into the cache (height → BufferedBlock), and every
+    /// `Output::Undo` removes the orphaned id. The cache is bounded;
+    /// height-LRU eviction handles aging.
+    block_cache: Option<SharedBlockCache<BufferedBlock>>,
+    /// Solidified-head broadcast. Updated on every successful
+    /// `fetch_solidified_head` tick. Read by the `CachingBlockOracle`
+    /// for cache-hit finality recomputation. The relayer holds the
+    /// sender; consumers (CLI passes the receiver to the oracle)
+    /// observe via `watch::Receiver`.
+    solidified_head_tx: Option<watch::Sender<Option<BlockHeight>>>,
 }
 
 impl<F: BlockFetcher> std::fmt::Debug for RelayerService<F> {
@@ -276,7 +288,25 @@ impl<F: BlockFetcher> RelayerService<F> {
             // 1024 covers TRON's reorg window with generous slack;
             // sustained orphan rate would evict before this saturates.
             horizon: ConsistencyHorizonObserver::new(1024),
+            block_cache: None,
+            solidified_head_tx: None,
         }
+    }
+
+    /// Attach a shared block cache. The relayer writes on every
+    /// emission; the firehose `Fetch.Block` handler reads. CLI is
+    /// responsible for passing the same `Arc` to both sides.
+    pub fn with_block_cache(mut self, cache: SharedBlockCache<BufferedBlock>) -> Self {
+        self.block_cache = Some(cache);
+        self
+    }
+
+    /// Attach a solidified-head broadcast. CLI threads the
+    /// corresponding `watch::Receiver` into the `CachingBlockOracle`
+    /// so cache-hit finality stays fresh as the chain advances.
+    pub fn with_solidified_head_tx(mut self, tx: watch::Sender<Option<BlockHeight>>) -> Self {
+        self.solidified_head_tx = Some(tx);
+        self
     }
 
     /// Run the pipeline forever (or until the output channel closes).
@@ -335,10 +365,16 @@ impl<F: BlockFetcher> RelayerService<F> {
                 )
                 .increment(1);
                 metrics::gauge!("lightcycle_relay_solidified_head").set(h as f64);
+                // Broadcast to anyone watching (the firehose
+                // `CachingBlockOracle` is the typical consumer).
+                if let Some(tx) = &self.solidified_head_tx {
+                    let _ = tx.send(Some(h));
+                }
                 let outs = self.engine.set_solidified_head(h);
                 for output in outs {
                     log_output(&output);
                     self.observe_for_horizon(&output);
+                    self.feed_cache(&output).await;
                     metrics::counter!(
                         "lightcycle_relay_outputs_total",
                         "step" => step_label(&output)
@@ -469,6 +505,7 @@ impl<F: BlockFetcher> RelayerService<F> {
                 for output in outputs {
                     log_output(&output);
                     self.observe_for_horizon(&output);
+                    self.feed_cache(&output).await;
                     metrics::counter!(
                         "lightcycle_relay_outputs_total",
                         "step" => step_label(&output)
@@ -528,6 +565,32 @@ impl<F: BlockFetcher> RelayerService<F> {
     /// Test/debug surface: read the current engine tip (immutable).
     pub fn tip_height(&self) -> Option<lightcycle_types::BlockHeight> {
         self.engine.tip().map(|t| t.height)
+    }
+
+    /// Feed the read-through block cache the firehose `Fetch.Block`
+    /// handler reads from. `Output::New` populates; `Output::Undo`
+    /// removes the orphaned id (a subsequent `New` at the same height
+    /// would replace it anyway via `BlockCache::insert`'s reorg path,
+    /// but explicit removal keeps the cache honest in the window
+    /// where Undo arrives without an immediate replacement).
+    /// `Irreversible` and the ledger variants don't carry block
+    /// payloads to populate; they're no-ops here.
+    async fn feed_cache(&self, output: &Output) {
+        let Some(cache) = &self.block_cache else {
+            return;
+        };
+        match output {
+            Output::New(s) => {
+                let mut guard = cache.write().await;
+                guard.insert(s.block.height, s.block.block_id, s.block.clone());
+            }
+            Output::Undo(s) => {
+                let mut guard = cache.write().await;
+                guard.remove_by_id(s.block.block_id);
+            }
+            Output::Irreversible(_) | Output::ForkObserved { .. } | Output::ForkResolved { .. } => {
+            }
+        }
     }
 
     /// Feed the consistency-horizon observer (ADR-0021 SLO). Called
@@ -923,5 +986,121 @@ mod tests {
             .await
             .expect("service should exit when output channel closes");
         assert!(matches!(r, Ok(Ok(()))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_cache_is_populated_on_new_emissions() {
+        // Linear chain — verify that after the service runs, the
+        // attached BlockCache contains every emitted block, indexed
+        // by both height and id.
+        let blocks = (100..103)
+            .scan(id(99, 0), |prev, h| {
+                let cur = id(h, 0xa);
+                let b = synth_block(h, cur, *prev);
+                *prev = cur;
+                Some(b)
+            })
+            .collect::<Vec<_>>();
+        let fetcher = ScriptedFetcher::new(blocks);
+        let cache = lightcycle_store::new_shared::<BufferedBlock>(16);
+        let svc = RelayerService::new(
+            fetcher,
+            small_engine(),
+            static_sr_set(None),
+            VerifyPolicy::Disabled,
+            Duration::from_millis(10),
+        )
+        .with_block_cache(cache.clone());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = tokio::spawn(svc.run(tx));
+        let _ = drain(&mut rx, 3).await;
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+
+        let cache_guard = cache.read().await;
+        assert_eq!(cache_guard.len(), 3);
+        for h in 100..103 {
+            let entry = cache_guard.get_by_height(h);
+            assert!(entry.is_some(), "cache missing height {h}");
+            let (block_id, _) = entry.unwrap();
+            assert_eq!(block_id, BlockId(id(h, 0xa)));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_cache_drops_orphan_on_undo() {
+        // 100a, 101a, 102a, then 102b reorg → the engine emits
+        // Undo(102a) + New(102b). Cache should hold 102b at height
+        // 102, and a lookup by 102a's id should miss.
+        let mut prev = id(99, 0);
+        let mut blocks = Vec::new();
+        for h in 100..103 {
+            let cur = id(h, 0xa);
+            blocks.push(synth_block(h, cur, prev));
+            prev = cur;
+        }
+        blocks.push(synth_block(102, id(102, 0xb), id(101, 0xa)));
+
+        let fetcher = ScriptedFetcher::new(blocks);
+        let cache = lightcycle_store::new_shared::<BufferedBlock>(16);
+        let svc = RelayerService::new(
+            fetcher,
+            small_engine(),
+            static_sr_set(None),
+            VerifyPolicy::Disabled,
+            Duration::from_millis(10),
+        )
+        .with_block_cache(cache.clone());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = tokio::spawn(svc.run(tx));
+        let _ = drain(&mut rx, 5).await;
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+
+        let cache_guard = cache.read().await;
+        // height 102 should be 102b's id, not 102a's.
+        let (cur_id, _) = cache_guard.get_by_height(102).expect("height 102 cached");
+        assert_eq!(cur_id, BlockId(id(102, 0xb)));
+        // Stale 102a id should not resolve.
+        assert!(cache_guard.get_by_id(BlockId(id(102, 0xa))).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn solidified_head_broadcast_fires_on_each_tick() {
+        // Wire a watch sender; the test fetcher reports a solidified
+        // head every tick. The watch receiver should observe the
+        // value (we just check it's been updated).
+        struct HeadFetcher {
+            head: BlockHeight,
+        }
+        #[async_trait]
+        impl BlockFetcher for HeadFetcher {
+            async fn fetch_now_block(&mut self) -> Result<FetchedBlock> {
+                anyhow::bail!("no blocks needed for head test")
+            }
+            async fn fetch_solidified_head(&mut self) -> Result<Option<BlockHeight>> {
+                Ok(Some(self.head))
+            }
+        }
+        let (head_tx, head_rx) = watch::channel::<Option<BlockHeight>>(None);
+        let svc = RelayerService::new(
+            HeadFetcher { head: 999 },
+            small_engine(),
+            static_sr_set(None),
+            VerifyPolicy::Disabled,
+            Duration::from_millis(10),
+        )
+        .with_solidified_head_tx(head_tx);
+
+        let (tx, rx) = mpsc::channel(16);
+        let handle = tokio::spawn(svc.run(tx));
+        // Wait long enough for at least one tick.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+
+        assert_eq!(*head_rx.borrow(), Some(999));
     }
 }
