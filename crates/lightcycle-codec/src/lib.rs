@@ -36,10 +36,13 @@
 //!   registry. Lives behind a future `decode_event(log, abi)` entry
 //!   point. v0.1 ships only the universal TRC-20 helpers above plus
 //!   raw [`Log`] passthrough.
-//! - **SM2 sigverify.** ~25% of TRON SRs sign with SM2 instead of
-//!   secp256k1; pulls in a separate crypto stack. Tracked as a
-//!   follow-up; v0.1 returns `WitnessAddressMismatch` on those blocks
-//!   and the relayer falls back to "trust the peer" for that header.
+//! - **SM2 sigverify.** Investigated 2026-05-09 (java-tron #6588,
+//!   PR #6627): the SM2 codepath exists in `SignUtils` but is dormant
+//!   on mainnet — `isECKeyCryptoEngine` is hard-true and no mainnet
+//!   SR signs with SM2. Core devs have proposed deleting the unused
+//!   module. lightcycle implements only secp256k1; a
+//!   `WitnessAddressMismatch` here means a real bug or an attacker,
+//!   not a benign engine mismatch.
 
 mod block;
 mod error;

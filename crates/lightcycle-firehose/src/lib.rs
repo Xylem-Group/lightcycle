@@ -24,16 +24,11 @@
 //!   typical caller.
 //!
 //! Out of scope for v0.1 (intentional, documented):
-//! - `Stream.Blocks` backfill via `cursor` or `start_block_num`
+//! - `Stream.Blocks` backfill via `cursor` or `start_block_num` —
+//!   gated on `lightcycle-store`'s persistent block cache.
 //! - `Fetch.Block` references other than `BlockNumber` (no
-//!   `BlockHashAndNumber`, no `Cursor`); no `transforms`
-//! - `final_blocks_only` and `transforms` on Stream
-//! - `TransactionInfo` side-channel join — the
-//!   `sf.tron.type.v1.Block` payload is fully populated for
-//!   header / transactions / contracts, but `Transaction.info`
-//!   (logs, internal txs, resource accounting) is unset because
-//!   ingest doesn't yet fetch `getTransactionInfoByBlockNum`. When
-//!   it does, no wire change is needed.
+//!   `BlockHashAndNumber`, no `Cursor`); no `transforms`.
+//! - `final_blocks_only` and `transforms` on Stream.
 
 #![allow(dead_code)]
 
