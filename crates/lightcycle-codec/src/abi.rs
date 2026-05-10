@@ -1,6 +1,6 @@
 //! Minimal ABI registry + event decoder for arbitrary contract logs.
 //!
-//! Sits alongside [`crate::events`] (which decodes the universal
+//! Sits alongside the `events` module (which decodes the universal
 //! TRC-20/721 events without a registry, by topic-0 hash). Where the
 //! universal decoder stops, this registry takes over: the operator
 //! pre-registers an event signature like
@@ -360,7 +360,7 @@ impl EventRegistry {
         self.by_topic0.is_empty()
     }
 
-    /// Look up by topic[0] without decoding. Useful when the consumer
+    /// Look up by `topic[0]` without decoding. Useful when the consumer
     /// just wants to know the event name.
     pub fn signature(&self, topic0: &[u8; 32]) -> Option<&EventSignature> {
         self.by_topic0.get(topic0)

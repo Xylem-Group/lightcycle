@@ -86,11 +86,8 @@ async fn handle(
     // Read enough to parse the request line. Bound the read so a
     // malicious slow-loris client can't tie up a task indefinitely.
     let mut buf = [0u8; 1024];
-    let n = match tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.read(&mut buf),
-    )
-    .await
+    let n = match tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf))
+        .await
     {
         Ok(Ok(n)) if n > 0 => n,
         _ => {
@@ -175,7 +172,10 @@ mod tests {
             parse_path(b"GET /readyz?probe=k8s HTTP/1.0\r\n\r\n"),
             Some("/readyz")
         );
-        assert_eq!(parse_path(b"HEAD /healthz HTTP/1.1\r\n\r\n"), Some("/healthz"));
+        assert_eq!(
+            parse_path(b"HEAD /healthz HTTP/1.1\r\n\r\n"),
+            Some("/healthz")
+        );
     }
 
     #[test]
