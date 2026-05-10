@@ -1,18 +1,22 @@
 //! Firehose v2 gRPC server: `Stream.Blocks` + `Fetch.Block` + `EndpointInfo.Info`.
 //!
-//! v0.1 surface:
+//! Surface:
 //!
-//! - **`Stream.Blocks`** — live mode only. The request's `cursor` and
-//!   `start_block_num` fields are not honored yet; backfill / replay
-//!   from a saved cursor lands when we wire the [`lightcycle-store`]
-//!   crate into the pipeline. Requests that supply either field get
-//!   a `FailedPrecondition` status with a clear message rather than
-//!   silent best-effort behavior.
+//! - **`Stream.Blocks`** — live tail with optional in-cache backfill.
+//!   When the StreamService has a [`SharedBlockCache`] attached
+//!   (see [`StreamService::with_block_cache`]), requests with
+//!   `start_block_num != 0` or a non-empty `cursor` walk the cache
+//!   from the requested height to its tip, then transition into the
+//!   live broadcast (with dedup so blocks emitted from the cache
+//!   aren't re-emitted from live). Without a cache, requests with
+//!   start hints get `FailedPrecondition`; live-tail requests work
+//!   either way.
 //! - **`Fetch.Block`** — point-in-time block lookup by height. Backed
-//!   by a [`BlockOracle`] (the CLI builds one over a dedicated
-//!   `GrpcSource` connection; future `lightcycle-store` cache impls
-//!   will compose). Only `BlockNumber` references are supported in
-//!   v0.1; `BlockHashAndNumber` and `Cursor` references return
+//!   by a [`BlockOracle`](crate::oracle::BlockOracle) (the CLI wires
+//!   a [`CachingBlockOracle`](crate::oracle::CachingBlockOracle) over
+//!   the read-through cache + a `GrpcBlockOracle` fallback). Only
+//!   `BlockNumber` references are supported in v0.1;
+//!   `BlockHashAndNumber` and `Cursor` references return
 //!   `FailedPrecondition`. No transforms.
 //! - **`EndpointInfo.Info`** — minimal: chain name, BlockIdEncoding=HEX,
 //!   first_streamable left at 0/empty (we don't track upstream chain
@@ -21,16 +25,13 @@
 //! ## Response shape
 //!
 //! `Response.metadata` is fully populated: num, id (hex), parent_num,
-//! parent_id (hex), lib_num, time. This is what dashboards and
-//! orchestrators read. `Response.block` carries an `Any` whose
-//! `type_url` is `sf.tron.type.v1.Block` and whose `value` is the
+//! parent_id (hex), lib_num, time. `Response.block` carries an `Any`
+//! whose `type_url` is `sf.tron.type.v1.Block` and whose `value` is the
 //! prost-encoded block — header, transactions, contracts (typed
 //! payloads for the four high-volume contract kinds + raw bytes for
-//! everything else). The `Transaction.info` field (logs, internal
-//! txs, resource accounting) is unset in v0.1 because the ingest
-//! pipeline doesn't yet fetch java-tron's
-//! `getTransactionInfoByBlockNum` side channel; that's a follow-up
-//! that drops in without a wire change.
+//! everything else), and `Transaction.info` (logs, internal txs,
+//! resource accounting) joined from java-tron's
+//! `getTransactionInfoByBlockNum` side channel.
 
 use std::pin::Pin;
 
@@ -40,9 +41,12 @@ use lightcycle_proto::firehose::v2::{
     stream_server::Stream as StreamSvc, BlockMetadata, ForkStep, InfoRequest, InfoResponse,
     Request, Response, SingleBlockRequest, SingleBlockResponse,
 };
-use lightcycle_relayer::Output;
+use lightcycle_relayer::{BufferedBlock, Cursor, Output, StreamableBlock};
+use lightcycle_store::SharedBlockCache;
+use lightcycle_types::{BlockFinality, BlockHeight, Step};
 use prost::Message;
 use prost_types::{Any, Timestamp};
+use tokio::sync::watch;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
@@ -54,14 +58,45 @@ use crate::oracle::SharedBlockOracle;
 
 /// Stream service. Holds a clone of the hub so each `blocks` RPC
 /// call subscribes to the live broadcast.
+///
+/// When [`Self::with_block_cache`] has been called, the service also
+/// honors `start_block_num` for in-cache backfill: it walks the
+/// cache from the requested height up to whatever's available, then
+/// transitions seamlessly into the live broadcast (with dedup so a
+/// block emitted from the cache isn't re-emitted from live).
+/// `start_block_num` requests with no cache attached, or with a
+/// height outside the cache window, are rejected with a precise
+/// `FailedPrecondition` message.
 #[derive(Clone, Debug)]
 pub struct StreamService {
     hub: Hub,
+    block_cache: Option<SharedBlockCache<BufferedBlock>>,
+    /// Solidified-head watch — needed to compute the right
+    /// `BlockFinality` for cached (cursor-resumed) blocks at emit
+    /// time. Same channel the relayer broadcasts to.
+    solidified_head: Option<watch::Receiver<Option<BlockHeight>>>,
 }
 
 impl StreamService {
     pub fn new(hub: Hub) -> Self {
-        Self { hub }
+        Self {
+            hub,
+            block_cache: None,
+            solidified_head: None,
+        }
+    }
+
+    /// Attach the read-through block cache for in-cache backfill via
+    /// `start_block_num`. Without this attach, requests with
+    /// `start_block_num != 0` fall through to the v0.1 reject path.
+    pub fn with_block_cache(
+        mut self,
+        cache: SharedBlockCache<BufferedBlock>,
+        solidified_head: watch::Receiver<Option<BlockHeight>>,
+    ) -> Self {
+        self.block_cache = Some(cache);
+        self.solidified_head = Some(solidified_head);
+        self
     }
 }
 
@@ -75,19 +110,33 @@ impl StreamSvc for StreamService {
     ) -> Result<tonic::Response<Self::BlocksStream>, Status> {
         let req = request.into_inner();
 
-        // v0.1: live mode only. Reject any request that asks for
-        // backfill so we fail fast rather than silently dropping
-        // the cursor/start_block_num intent on the floor.
-        if !req.cursor.is_empty() {
+        // Decide where to start. Cursor takes precedence over
+        // start_block_num if both are set (a cursor encodes a
+        // canonical position; start_block_num is just the height).
+        let start_height: Option<BlockHeight> = if !req.cursor.is_empty() {
+            let bytes = hex::decode(&req.cursor)
+                .map_err(|e| Status::invalid_argument(format!("cursor is not valid hex: {e}")))?;
+            let cur = Cursor::from_bytes(&bytes).ok_or_else(|| {
+                Status::invalid_argument("cursor decode failed: expected 40-byte cursor blob")
+            })?;
+            // Resume from the next height; the consumer has already
+            // seen `cur.height`.
+            Some(cur.height.saturating_add(1))
+        } else if req.start_block_num > 0 {
+            // Firehose v2's start_block_num is i64; negative values
+            // mean "head minus N" by convention but we don't honor that
+            // in v0.1 (would require knowing live head at request
+            // time). Treat 0 as "live tail only" (the default).
+            Some(req.start_block_num as u64)
+        } else if req.start_block_num < 0 {
             return Err(Status::failed_precondition(
-                "backfill via cursor not implemented in v0.1; live-from-now only",
+                "negative start_block_num (head-relative offset) not implemented in v0.1; \
+                 pass an absolute height",
             ));
-        }
-        if req.start_block_num != 0 {
-            return Err(Status::failed_precondition(
-                "start_block_num not implemented in v0.1; live-from-now only",
-            ));
-        }
+        } else {
+            None
+        };
+
         if req.stop_block_num != 0 {
             return Err(Status::failed_precondition(
                 "stop_block_num not implemented in v0.1; stream is unbounded",
@@ -106,21 +155,118 @@ impl StreamSvc for StreamService {
             ));
         }
 
-        debug!("new firehose subscriber connecting");
+        debug!(?start_height, "new firehose subscriber connecting");
         metrics::counter!("lightcycle_firehose_subscriptions_total").increment(1);
 
-        let rx = self.hub.subscribe();
-        // tokio_stream's BroadcastStream wraps the Receiver in a
-        // proper Stream impl that holds the recv future across polls
-        // — necessary so the broadcast send wakes us on the next
-        // message rather than silently dropping the waker.
-        // Filter ledger-entry variants (ForkObserved / ForkResolved) at
-        // the gRPC boundary: Firehose v2's `Response` has no STATUS
-        // shape, and the audit ledger flows through tracing logs +
-        // metrics on the relayer side instead. See ARCHITECTURE.md
-        // "Finality discipline" + ADR-0021 §3.
-        let stream = BroadcastStream::new(rx).filter_map(|res| match res {
-            Ok(output) => output_to_response(output).map(Ok),
+        // Subscribe to live BEFORE walking the cache so we don't
+        // miss anything emitted during the walk. The order here is
+        // load-bearing for at-least-once delivery.
+        let live_rx = self.hub.subscribe();
+
+        // Decide on backfill mode.
+        let backfill: Vec<Response> = if let Some(h) = start_height {
+            let Some(cache) = &self.block_cache else {
+                return Err(Status::failed_precondition(
+                    "backfill requested (start_block_num or cursor) but no block cache \
+                     attached to this firehose; restart relayer with --firehose-listen \
+                     and --block-cache-capacity > 0",
+                ));
+            };
+            // Snapshot the relevant cache range under read lock,
+            // then drop the lock before doing anything else.
+            let head = self.solidified_head.as_ref().and_then(|w| *w.borrow());
+            let snapshot = {
+                let guard = cache.read().await;
+                let (Some(min_h), Some(max_h)) = (guard.min_height(), guard.max_height()) else {
+                    // Cache is empty — nothing to backfill from. The
+                    // honest response is "ask later," not silently
+                    // attaching to live (which would create a gap).
+                    return Err(Status::failed_precondition(
+                        "block cache is empty; cannot serve backfill yet",
+                    ));
+                };
+                if h < min_h {
+                    return Err(Status::failed_precondition(format!(
+                        "start height {h} is below cache window [{min_h}, {max_h}]; \
+                         backfill beyond the cache window is not yet supported"
+                    )));
+                }
+                if h > max_h.saturating_add(1) {
+                    // The +1 is the boundary case "start at the next
+                    // block after the current tip" — that's a valid
+                    // request that simply has zero backfill rows; we
+                    // should not error on it.
+                    return Err(Status::failed_precondition(format!(
+                        "start height {h} is ahead of cache tip {max_h}; \
+                         remove start_block_num or wait for the chain to advance"
+                    )));
+                }
+                // Walk min(h, max_h+1)..=max_h. Per-height lookup is
+                // O(log n) on the BTreeMap — fast in practice.
+                let upper = max_h;
+                let mut rows = Vec::new();
+                for height in h..=upper {
+                    if let Some((_id, buffered)) = guard.get_by_height(height) {
+                        rows.push(buffered);
+                    } else {
+                        // Height is in the [min, max] interval but the
+                        // entry was evicted between min/max snapshot
+                        // and the per-height lookup. Treat as cache
+                        // miss and refuse — this should be rare, and a
+                        // partial walk would create gaps the consumer
+                        // can't detect.
+                        return Err(Status::failed_precondition(format!(
+                            "block at height {height} evicted from cache mid-walk; \
+                             retry with the same start_block_num"
+                        )));
+                    }
+                }
+                rows
+            };
+
+            metrics::counter!(
+                "lightcycle_firehose_backfill_total",
+                "result" => "ok"
+            )
+            .increment(1);
+            metrics::histogram!("lightcycle_firehose_backfill_blocks")
+                .record(snapshot.len() as f64);
+
+            snapshot
+                .into_iter()
+                .map(|buffered| {
+                    let height = buffered.height;
+                    let finality = BlockFinality::for_block(height, head, false);
+                    let cursor = Cursor::new(buffered.height, buffered.block_id);
+                    let sb = StreamableBlock {
+                        block: buffered,
+                        step: Step::New,
+                        finality,
+                        cursor,
+                    };
+                    streamable_to_response(sb, ForkStep::StepNew)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let last_backfill_height = backfill
+            .last()
+            .and_then(|r| r.metadata.as_ref().map(|m| m.num));
+
+        // Live stream with dedup against the backfill range.
+        let live_stream = BroadcastStream::new(live_rx).filter_map(move |res| match res {
+            Ok(output) => {
+                // If we backfilled up to height B, drop any live
+                // emission with height ≤ B (it was already shipped
+                // from the cache snapshot).
+                let response = output_to_response(output)?;
+                match (last_backfill_height, response.metadata.as_ref()) {
+                    (Some(b), Some(m)) if m.num <= b => None,
+                    _ => Some(Ok(response)),
+                }
+            }
             Err(BroadcastStreamRecvError::Lagged(skipped)) => {
                 warn!(skipped, "firehose subscriber lagged");
                 metrics::counter!(
@@ -135,7 +281,42 @@ impl StreamSvc for StreamService {
             }
         });
 
-        Ok(tonic::Response::new(Box::pin(stream)))
+        // Chain backfill (already-materialized Vec) onto the live
+        // stream. The backfill items are emitted in order; live
+        // begins after.
+        let backfill_stream = tokio_stream::iter(backfill.into_iter().map(Ok));
+        let combined = backfill_stream.chain(live_stream);
+
+        Ok(tonic::Response::new(Box::pin(combined)))
+    }
+}
+
+/// Encode a single StreamableBlock to a Firehose Response. Used by
+/// the backfill walk; live-stream emissions go through
+/// [`output_to_response`].
+fn streamable_to_response(sb: StreamableBlock, step: ForkStep) -> Response {
+    let height = sb.block.height;
+    let parent_height = height.saturating_sub(1);
+    let block_id_hex = hex::encode(sb.block.block_id.0);
+    let parent_id_hex = hex::encode(sb.block.parent_id.0);
+    let metadata = BlockMetadata {
+        num: height,
+        id: block_id_hex,
+        parent_num: parent_height,
+        parent_id: parent_id_hex,
+        lib_num: sb.finality.solidified_head.unwrap_or(0),
+        time: Some(timestamp_from_ms(sb.block.decoded.header.timestamp_ms)),
+    };
+    let block_pb = encode_block(&sb.block, sb.finality);
+    let block_any = Any {
+        type_url: BLOCK_TYPE_URL.into(),
+        value: block_pb.encode_to_vec(),
+    };
+    Response {
+        block: Some(block_any),
+        step: step as i32,
+        cursor: hex::encode(sb.cursor.to_bytes()),
+        metadata: Some(metadata),
     }
 }
 

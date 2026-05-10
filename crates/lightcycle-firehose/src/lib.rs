@@ -2,11 +2,11 @@
 //!
 //! Speaks `sf.firehose.v2` so Substreams (and any other Firehose
 //! consumer) can subscribe to live block streams with reorg-correct
-//! step semantics. v0.1 ships `Stream.Blocks` (live mode only),
-//! `Fetch.Block` (point-in-time by number), and `EndpointInfo.Info`.
-//! `Stream.Blocks` backfill via cursor / start_block_num requires the
-//! `lightcycle-store` crate to be wired in, which is a separate piece
-//! of work.
+//! step semantics. Ships `Stream.Blocks` (live tail + in-cache
+//! backfill via `start_block_num` or `cursor`), `Fetch.Block`
+//! (point-in-time by number), and `EndpointInfo.Info`. Backfill
+//! beyond the in-memory cache window requires a persistent block
+//! archive, which is a separate piece of work.
 //!
 //! Architecture in four pieces:
 //!
@@ -24,8 +24,8 @@
 //!   typical caller.
 //!
 //! Out of scope for v0.1 (intentional, documented):
-//! - `Stream.Blocks` backfill via `cursor` or `start_block_num` —
-//!   gated on `lightcycle-store`'s persistent block cache.
+//! - Backfill beyond the in-memory cache window — gated on a
+//!   persistent block archive (redb spill from `lightcycle-store`).
 //! - `Fetch.Block` references other than `BlockNumber` (no
 //!   `BlockHashAndNumber`, no `Cursor`); no `transforms`.
 //! - `final_blocks_only` and `transforms` on Stream.
@@ -42,6 +42,19 @@ pub use hub::Hub;
 pub use oracle::{describe_oracle_metrics, BlockOracle, CachingBlockOracle, SharedBlockOracle};
 pub use server::{EndpointInfoService, FetchService, StreamService};
 
+// Backfill metrics — described here so they show up before the
+// first request.
+pub fn describe_backfill_metrics() {
+    metrics::describe_counter!(
+        "lightcycle_firehose_backfill_total",
+        "Stream.Blocks backfill walks, labelled by result (ok / out_of_window / cache_miss)"
+    );
+    metrics::describe_histogram!(
+        "lightcycle_firehose_backfill_blocks",
+        "Number of blocks emitted from the in-memory cache during a Stream.Blocks backfill."
+    );
+}
+
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
@@ -49,23 +62,50 @@ use lightcycle_proto::firehose::v2::{
     endpoint_info_server::EndpointInfoServer, fetch_server::FetchServer,
     stream_server::StreamServer,
 };
+use lightcycle_relayer::BufferedBlock;
+use lightcycle_store::SharedBlockCache;
+use lightcycle_types::BlockHeight;
+use tokio::sync::watch;
 use tonic::transport::Server;
 use tracing::info;
+
+/// Optional backfill wiring for [`serve`]. When both fields are
+/// `Some`, `Stream.Blocks` honors `start_block_num` and `cursor`
+/// requests by walking the cache before joining the live broadcast.
+/// When either is `None`, requests with start hints get rejected
+/// with `FailedPrecondition`.
+#[derive(Clone)]
+pub struct StreamBackfill {
+    pub cache: SharedBlockCache<BufferedBlock>,
+    pub solidified_head: watch::Receiver<Option<BlockHeight>>,
+}
+
+impl std::fmt::Debug for StreamBackfill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamBackfill").finish_non_exhaustive()
+    }
+}
 
 /// Run the gRPC server until the shutdown future resolves.
 ///
 /// `chain_name` is reflected in `EndpointInfo.Info` (e.g. "tron-mainnet");
 /// `hub` provides the live broadcast for `Stream.Blocks`; `oracle` backs
-/// `Fetch.Block`. The future returned by `shutdown` (typically
-/// `tokio::signal::ctrl_c()`) drives graceful shutdown.
+/// `Fetch.Block`. `backfill` is the optional cache + head watch that
+/// powers `Stream.Blocks` resume — pass `None` to run live-tail-only.
+/// The future returned by `shutdown` (typically `tokio::signal::ctrl_c()`)
+/// drives graceful shutdown.
 pub async fn serve(
     listen: SocketAddr,
     hub: Hub,
     oracle: SharedBlockOracle,
     chain_name: impl Into<String>,
+    backfill: Option<StreamBackfill>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let stream_svc = StreamService::new(hub);
+    let stream_svc = match backfill {
+        Some(b) => StreamService::new(hub).with_block_cache(b.cache, b.solidified_head),
+        None => StreamService::new(hub),
+    };
     let fetch_svc = FetchService::new(oracle);
     let info_svc = EndpointInfoService::new(chain_name);
 

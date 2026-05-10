@@ -3,9 +3,11 @@
 //! Output through the hub, assert the client receives a Response
 //! with the right step + metadata.
 //!
-//! Skipping `start_block_num` / cursor / final_blocks_only paths —
-//! those are explicitly rejected at v0.1 and have unit-test coverage
-//! in `src/server.rs`. This test covers the live happy path.
+//! Covers: live happy path; Fetch.Block round-trip; EndpointInfo;
+//! malformed-cursor rejection; backfill-without-cache rejection;
+//! in-cache backfill walk; live/cache overlap dedup.
+//! `final_blocks_only`, `transforms`, and stop_block_num are unit-
+//! tested in `src/server.rs` (server-side reject paths).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,7 +101,7 @@ async fn live_stream_round_trip() {
     let server = tokio::spawn({
         let hub = hub.clone();
         async move {
-            let _ = serve(addr, hub, empty_oracle(), "tron-test", async move {
+            let _ = serve(addr, hub, empty_oracle(), "tron-test", None, async move {
                 let _ = shutdown_rx.await;
             })
             .await;
@@ -177,9 +179,16 @@ async fn endpoint_info_round_trip() {
     let server = tokio::spawn({
         let hub = hub.clone();
         async move {
-            let _ = serve(addr, hub, empty_oracle(), "tron-mainnet", async move {
-                let _ = shutdown_rx.await;
-            })
+            let _ = serve(
+                addr,
+                hub,
+                empty_oracle(),
+                "tron-mainnet",
+                None,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
             .await;
         }
     });
@@ -264,6 +273,7 @@ async fn fetch_block_round_trip() {
                 hub,
                 Arc::new(OneBlockOracle) as SharedBlockOracle,
                 "tron-test",
+                None,
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -316,14 +326,16 @@ async fn fetch_block_round_trip() {
 }
 
 #[tokio::test]
-async fn live_stream_rejects_cursor_request() {
+async fn live_stream_rejects_malformed_cursor() {
+    // A non-empty cursor that isn't 40 bytes (or isn't valid hex)
+    // is a client-side bug; surface as InvalidArgument.
     let hub = Hub::new(8);
     let addr = pick_addr().await;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn({
         let hub = hub.clone();
         async move {
-            let _ = serve(addr, hub, empty_oracle(), "tron-test", async move {
+            let _ = serve(addr, hub, empty_oracle(), "tron-test", None, async move {
                 let _ = shutdown_rx.await;
             })
             .await;
@@ -343,14 +355,295 @@ async fn live_stream_rejects_cursor_request() {
     let err = client
         .blocks(Request {
             start_block_num: 0,
-            cursor: "deadbeef".into(), // non-empty cursor
+            cursor: "deadbeef".into(), // 4 bytes, not 40
             stop_block_num: 0,
             final_blocks_only: false,
             transforms: vec![],
         })
         .await
-        .expect_err("expected FailedPrecondition for cursor=...");
+        .expect_err("expected InvalidArgument for malformed cursor");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn backfill_rejected_when_no_cache_attached() {
+    // start_block_num != 0 but no StreamBackfill wired → reject
+    // with FailedPrecondition. Honest "this server isn't configured
+    // for backfill" rather than silently doing live-only.
+    let hub = Hub::new(8);
+    let addr = pick_addr().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            let _ = serve(addr, hub, empty_oracle(), "tron-test", None, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+    let mut client = None;
+    for _ in 0..40 {
+        if let Ok(c) = StreamClient::connect(format!("http://{addr}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = client.expect("server didn't accept connections");
+
+    // FailedPrecondition surfaces at the rpc-call level (it's
+    // produced before we hand back the stream). tonic returns the
+    // status from `blocks().await`, not from the stream's first
+    // frame.
+    let err = client
+        .blocks(Request {
+            start_block_num: 100,
+            cursor: String::new(),
+            stop_block_num: 0,
+            final_blocks_only: false,
+            transforms: vec![],
+        })
+        .await
+        .expect_err("expected FailedPrecondition for backfill without cache");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("no block cache"),
+        "expected 'no block cache' in error message, got: {}",
+        err.message()
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn backfill_walks_cache_and_then_streams_live() {
+    // Pre-populate the cache with heights 100..103. Subscribe with
+    // start_block_num=100. Expect to receive 100, 101, 102 from the
+    // backfill walk; then push 103 onto the hub and expect to
+    // receive 103 on the live tail (no duplication).
+    let hub = Hub::new(64);
+    let cache = lightcycle_store::new_shared::<BufferedBlock>(16);
+    {
+        let mut g = cache.write().await;
+        for h in 100..103u64 {
+            let buffered = BufferedBlock {
+                height: h,
+                block_id: BlockId([h as u8; 32]),
+                parent_id: BlockId([(h - 1) as u8; 32]),
+                fork_id: 0,
+                decoded: DecodedBlock {
+                    header: DecodedHeader {
+                        height: h,
+                        block_id: BlockId([h as u8; 32]),
+                        parent_id: BlockId([(h - 1) as u8; 32]),
+                        raw_data_hash: [0u8; 32],
+                        tx_trie_root: [0u8; 32],
+                        timestamp_ms: 1_777_854_558_000 + h as i64,
+                        witness: Address([0x41; 21]),
+                        witness_signature: vec![],
+                        version: 34,
+                    },
+                    transactions: vec![],
+                },
+                tx_infos: vec![],
+            };
+            g.insert(h, buffered.block_id, buffered);
+        }
+    }
+    let (_head_tx, head_rx) =
+        tokio::sync::watch::channel::<Option<lightcycle_types::BlockHeight>>(None);
+    let backfill = lightcycle_firehose::StreamBackfill {
+        cache: cache.clone(),
+        solidified_head: head_rx,
+    };
+
+    let addr = pick_addr().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            let _ = serve(
+                addr,
+                hub,
+                empty_oracle(),
+                "tron-test",
+                Some(backfill),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await;
+        }
+    });
+
+    let mut client = None;
+    for _ in 0..40 {
+        if let Ok(c) = StreamClient::connect(format!("http://{addr}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = client.expect("server didn't accept connections");
+
+    let mut stream = client
+        .blocks(Request {
+            start_block_num: 100,
+            cursor: String::new(),
+            stop_block_num: 0,
+            final_blocks_only: false,
+            transforms: vec![],
+        })
+        .await
+        .expect("stream request accepted")
+        .into_inner();
+
+    // First three frames come from the backfill walk: 100, 101, 102.
+    for expected in 100..103u64 {
+        let resp = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("backfill frame timed out")
+            .expect("backfill stream ended early")
+            .expect("backfill frame is Err");
+        assert_eq!(resp.metadata.unwrap().num, expected);
+    }
+
+    // Now push live height 103 through the hub. Expect to receive
+    // it; expect NOT to receive a duplicate of any backfilled
+    // height.
+    hub.sender()
+        .send(synth_output(Step::New, 103))
+        .expect("broadcast send");
+    let resp = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("live frame timed out")
+        .expect("stream ended")
+        .expect("live frame is Err");
+    assert_eq!(resp.metadata.unwrap().num, 103);
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn backfill_dedups_when_cache_overlaps_live() {
+    // Cache has heights 100..103. Push live emissions for 102 and
+    // 103 onto the hub BEFORE subscribing (they'll be in the
+    // broadcast buffer when our subscriber attaches). Subscribe
+    // with start_block_num=100. Expect 100, 101, 102 from
+    // backfill; then 103 from live (102 was buffered live but
+    // dedup'd).
+    let hub = Hub::new(64);
+    let cache = lightcycle_store::new_shared::<BufferedBlock>(16);
+    {
+        let mut g = cache.write().await;
+        for h in 100..103u64 {
+            let buffered = BufferedBlock {
+                height: h,
+                block_id: BlockId([h as u8; 32]),
+                parent_id: BlockId([(h - 1) as u8; 32]),
+                fork_id: 0,
+                decoded: DecodedBlock {
+                    header: DecodedHeader {
+                        height: h,
+                        block_id: BlockId([h as u8; 32]),
+                        parent_id: BlockId([(h - 1) as u8; 32]),
+                        raw_data_hash: [0u8; 32],
+                        tx_trie_root: [0u8; 32],
+                        timestamp_ms: 1_777_854_558_000 + h as i64,
+                        witness: Address([0x41; 21]),
+                        witness_signature: vec![],
+                        version: 34,
+                    },
+                    transactions: vec![],
+                },
+                tx_infos: vec![],
+            };
+            g.insert(h, buffered.block_id, buffered);
+        }
+    }
+    let (_head_tx, head_rx) =
+        tokio::sync::watch::channel::<Option<lightcycle_types::BlockHeight>>(None);
+    let backfill = lightcycle_firehose::StreamBackfill {
+        cache: cache.clone(),
+        solidified_head: head_rx,
+    };
+
+    let addr = pick_addr().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let hub_for_serve = hub.clone();
+    let server = tokio::spawn(async move {
+        let _ = serve(
+            addr,
+            hub_for_serve,
+            empty_oracle(),
+            "tron-test",
+            Some(backfill),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await;
+    });
+    let mut client = None;
+    for _ in 0..40 {
+        if let Ok(c) = StreamClient::connect(format!("http://{addr}")).await {
+            client = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut client = client.expect("server didn't accept connections");
+
+    let mut stream = client
+        .blocks(Request {
+            start_block_num: 100,
+            cursor: String::new(),
+            stop_block_num: 0,
+            final_blocks_only: false,
+            transforms: vec![],
+        })
+        .await
+        .expect("stream request accepted")
+        .into_inner();
+
+    // Drain backfill (3 frames: 100, 101, 102).
+    let mut backfilled = Vec::new();
+    for _ in 0..3 {
+        let r = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        backfilled.push(r.metadata.unwrap().num);
+    }
+    assert_eq!(backfilled, vec![100, 101, 102]);
+
+    // After the subscription is in place, push 102 (overlap) +
+    // 103 (new) live. The 102 must be deduplicated; the 103 must
+    // arrive.
+    hub.sender()
+        .send(synth_output(Step::New, 102))
+        .expect("broadcast send 102");
+    hub.sender()
+        .send(synth_output(Step::New, 103))
+        .expect("broadcast send 103");
+
+    let resp = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        resp.metadata.unwrap().num,
+        103,
+        "expected 103 (102 should be dedup'd)"
+    );
 
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

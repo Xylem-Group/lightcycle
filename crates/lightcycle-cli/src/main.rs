@@ -521,12 +521,24 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let chain_name = args.firehose_chain_name.clone();
         let hub_for_serve = hub.clone();
+        let backfill = block_cache
+            .clone()
+            .map(|cache| lightcycle_firehose::StreamBackfill {
+                cache,
+                solidified_head: head_rx.clone(),
+            });
         let server_handle = tokio::spawn(async move {
-            if let Err(e) =
-                lightcycle_firehose::serve(listen, hub_for_serve, oracle, chain_name, async move {
+            if let Err(e) = lightcycle_firehose::serve(
+                listen,
+                hub_for_serve,
+                oracle,
+                chain_name,
+                backfill,
+                async move {
                     let _ = server_shutdown_rx.await;
-                })
-                .await
+                },
+            )
+            .await
             {
                 tracing::error!(error = %e, "firehose server exited with error");
             }
