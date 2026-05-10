@@ -32,11 +32,13 @@
 
 #![allow(dead_code)]
 
+mod archiver;
 mod encode;
 mod hub;
 mod oracle;
 mod server;
 
+pub use archiver::{describe_archiver_metrics, run_archiver};
 pub use encode::{encode_block, BLOCK_TYPE_URL};
 pub use hub::Hub;
 pub use oracle::{describe_oracle_metrics, BlockOracle, CachingBlockOracle, SharedBlockOracle};
@@ -63,26 +65,39 @@ use lightcycle_proto::firehose::v2::{
     stream_server::StreamServer,
 };
 use lightcycle_relayer::BufferedBlock;
-use lightcycle_store::SharedBlockCache;
+use lightcycle_store::{BlockArchive, SharedBlockCache};
 use lightcycle_types::BlockHeight;
 use tokio::sync::watch;
 use tonic::transport::Server;
 use tracing::info;
 
-/// Optional backfill wiring for [`serve`]. When both fields are
-/// `Some`, `Stream.Blocks` honors `start_block_num` and `cursor`
-/// requests by walking the cache before joining the live broadcast.
-/// When either is `None`, requests with start hints get rejected
-/// with `FailedPrecondition`.
+/// Optional backfill wiring for [`serve`]. When `cache` and
+/// `solidified_head` are present, `Stream.Blocks` honors
+/// `start_block_num` and `cursor` requests by walking the cache before
+/// joining the live broadcast. When `archive` is also present, the
+/// backfill walker first fills the gap from the archive (height range
+/// `[requested_start, cache.min_height - 1]`) before chaining into the
+/// cache walk — extending resume support past the in-memory window.
+///
+/// All three are independent: a cache without an archive serves only
+/// the in-memory window; an archive without a cache serves only past
+/// blocks (rare, but valid for cold-archive consumers).
 #[derive(Clone)]
 pub struct StreamBackfill {
     pub cache: SharedBlockCache<BufferedBlock>,
     pub solidified_head: watch::Receiver<Option<BlockHeight>>,
+    /// Persistent block archive for resume past the in-memory cache
+    /// window. `None` keeps lightcycle on the v0.x in-memory-only
+    /// behavior; `Some(_)` extends backfill to the archive's retention
+    /// floor.
+    pub archive: Option<BlockArchive>,
 }
 
 impl std::fmt::Debug for StreamBackfill {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamBackfill").finish_non_exhaustive()
+        f.debug_struct("StreamBackfill")
+            .field("archive", &self.archive.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -102,11 +117,25 @@ pub async fn serve(
     backfill: Option<StreamBackfill>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    // The archive (if present) is shared between Stream.Blocks
+    // backfill and Fetch.Block — both fall through to it on cache
+    // miss. Pull it out before consuming `backfill` in the Stream
+    // service builder.
+    let archive_for_fetch = backfill.as_ref().and_then(|b| b.archive.clone());
     let stream_svc = match backfill {
-        Some(b) => StreamService::new(hub).with_block_cache(b.cache, b.solidified_head),
+        Some(b) => {
+            let mut svc = StreamService::new(hub).with_block_cache(b.cache, b.solidified_head);
+            if let Some(arc) = b.archive {
+                svc = svc.with_archive(arc);
+            }
+            svc
+        }
         None => StreamService::new(hub),
     };
-    let fetch_svc = FetchService::new(oracle);
+    let mut fetch_svc = FetchService::new(oracle);
+    if let Some(arc) = archive_for_fetch {
+        fetch_svc = fetch_svc.with_archive(arc);
+    }
     let info_svc = EndpointInfoService::new(chain_name);
 
     info!(%listen, "firehose gRPC server starting");
