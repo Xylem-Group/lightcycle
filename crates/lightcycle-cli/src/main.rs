@@ -190,6 +190,33 @@ struct RelayArgs {
     )]
     block_cache_capacity: usize,
 
+    /// Path to the persistent block archive (redb file). When set, the
+    /// archiver task subscribes to the broadcast and writes every
+    /// `Output::Irreversible` to disk; Stream.Blocks backfill walks
+    /// the archive for any height below the in-memory cache window;
+    /// Fetch.Block hits the archive on cache miss to short-circuit
+    /// upstream RPC. When unset, lightcycle runs in the v0.x
+    /// in-memory-only mode (~1h backfill window).
+    ///
+    /// File is created on first use; existing data is preserved
+    /// across restarts. Disk usage is roughly 50 KB × archived
+    /// blocks; a year of mainnet at 3-second slots fits in ~500 GB.
+    /// Couple with `--archive-retention-blocks` to bound disk growth.
+    #[arg(long, env = "LIGHTCYCLE_RELAY_ARCHIVE_PATH")]
+    archive_path: Option<std::path::PathBuf>,
+
+    /// Retain only the most recent N blocks in the archive (relative
+    /// to the chain's current solidified head). 0 means "keep
+    /// everything" — appropriate for cold-archive deployments. The
+    /// retention task runs every minute; the archive grows past the
+    /// floor between runs. Default 0 (no retention).
+    #[arg(
+        long,
+        env = "LIGHTCYCLE_RELAY_ARCHIVE_RETENTION_BLOCKS",
+        default_value_t = 0
+    )]
+    archive_retention_blocks: u64,
+
     /// Whether to fetch the `TransactionInfo` side channel for each
     /// block (logs, internal txs, resource accounting). Default true:
     /// the dominant TRC-20 / TRC-721 indexing use case needs it. Set
@@ -489,9 +516,35 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
     let firehose_handles = if let Some(listen) = args.firehose_listen {
         lightcycle_firehose::describe_metrics();
         lightcycle_firehose::describe_oracle_metrics();
+        lightcycle_firehose::describe_backfill_metrics();
+        lightcycle_firehose::describe_archiver_metrics();
         lightcycle_store::describe_cache_metrics();
+        lightcycle_store::describe_archive_metrics();
         let hub = lightcycle_firehose::Hub::new(args.firehose_hub_capacity);
         let pump_handle = hub.pump_from(output_rx);
+
+        // Open the persistent block archive when configured. None
+        // keeps lightcycle in the v0.x in-memory-only behavior; Some
+        // wires the archiver task and the read paths below.
+        let archive: Option<lightcycle_store::BlockArchive> = match args.archive_path.as_ref() {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("create archive directory {parent:?}"))?;
+                    }
+                }
+                let archive = lightcycle_store::BlockArchive::open(path)
+                    .with_context(|| format!("open block archive {path:?}"))?;
+                tracing::info!(
+                    path = %path.display(),
+                    blocks = archive.len().unwrap_or(0),
+                    "block archive opened",
+                );
+                Some(archive)
+            }
+            None => None,
+        };
 
         // Build the Fetch.Block oracle. Needs its own GrpcSource
         // connection because the relayer's source is owned by the live-
@@ -518,6 +571,57 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
             None => std::sync::Arc::new(upstream_oracle),
         };
 
+        // Spawn the archiver task before the gRPC server so it's
+        // already subscribed when the first Output::Irreversible
+        // arrives. Aborts on shutdown via the broadcast sender being
+        // dropped.
+        let archiver_handle = if let Some(arc) = archive.clone() {
+            let rx = hub.subscribe();
+            Some(tokio::spawn(lightcycle_firehose::run_archiver(rx, arc)))
+        } else {
+            None
+        };
+
+        // Spawn the retention pruner when requested. Reads the
+        // current head from the watch channel; computes the floor
+        // height; calls archive.delete_below() once a minute.
+        let retention_handle = if let (Some(arc), n) =
+            (archive.clone(), args.archive_retention_blocks)
+        {
+            if n > 0 {
+                let mut head_rx_for_retention = head_rx.clone();
+                Some(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ticker.tick().await; // arm
+                    loop {
+                        tokio::select! {
+                            _ = ticker.tick() => {
+                                let head = *head_rx_for_retention.borrow();
+                                if let Some(h) = head {
+                                    let floor = h.saturating_sub(n);
+                                    match arc.delete_below(floor) {
+                                        Ok(removed) if removed > 0 => {
+                                            tracing::info!(
+                                                floor, removed, "archive retention pruned"
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => tracing::warn!(error = %e, "archive prune failed"),
+                                    }
+                                }
+                            }
+                            Ok(()) = head_rx_for_retention.changed() => {}
+                        }
+                    }
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let chain_name = args.firehose_chain_name.clone();
         let hub_for_serve = hub.clone();
@@ -526,6 +630,7 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
             .map(|cache| lightcycle_firehose::StreamBackfill {
                 cache,
                 solidified_head: head_rx.clone(),
+                archive: archive.clone(),
             });
         let server_handle = tokio::spawn(async move {
             if let Err(e) = lightcycle_firehose::serve(
@@ -543,7 +648,29 @@ async fn run_relay(args: RelayArgs) -> Result<()> {
                 tracing::error!(error = %e, "firehose server exited with error");
             }
         });
-        Some((server_handle, pump_handle, server_shutdown_tx))
+        // Stash the archiver / retention handles in the firehose
+        // tuple so the shutdown branch aborts them with the rest. We
+        // pack them into a single Vec<JoinHandle<()>> to keep the
+        // shutdown branch's pattern unchanged.
+        let mut aux_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        if let Some(h) = archiver_handle {
+            aux_handles.push(h);
+        }
+        if let Some(h) = retention_handle {
+            aux_handles.push(h);
+        }
+        // Replace the bare pump_handle with a wrapper that also
+        // awaits the aux handles on shutdown via abort().
+        let composite_pump_handle = tokio::spawn(async move {
+            // The original pump_handle drives indefinitely; we abort
+            // it from the outer shutdown path. Aux handles are
+            // aborted here on the outer scope's drop.
+            let _ = pump_handle.await;
+            for h in aux_handles {
+                h.abort();
+            }
+        });
+        Some((server_handle, composite_pump_handle, server_shutdown_tx))
     } else {
         // Log-only mode: drain the mpsc into the void so the service
         // doesn't back-pressure. The service already logs each block;
