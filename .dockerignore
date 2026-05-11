@@ -1,0 +1,26 @@
+# Build artifacts — never needed inside the container build context.
+# Without this exclusion, `COPY . .` in docker/lightcycle.Dockerfile
+# tars the entire target/ tree (multi-GB) and ships it to the BuildKit
+# daemon before any RUN line executes — minutes of wasted I/O and
+# context-cache invalidation on every source edit.
+target/
+
+# Git internals — the Dockerfile doesn't run any `git` commands, so the
+# repo history adds nothing. .git can be tens of MB of pack files.
+.git/
+
+# CI + local tooling — not used by the build.
+.github/
+.claude/
+.envrc
+.direnv/
+
+# Test outputs / scratch.
+*.profraw
+*.profdata
+coverage/
+
+# OS / editor cruft.
+.DS_Store
+*.swp
+*.swo
